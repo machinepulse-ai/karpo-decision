@@ -5,9 +5,8 @@ process, one request at a time, and what the leaderboard's maintainers time.
         --option checkpoint=path/to/checkpoint --out runs/karpo-decision
 
 Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or ``reversed``: ``karpo_decision.views``);
-``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``). It answers with the plain ``Decider``.
-A request outside the contract, or with a question that does not fit ``max_length`` tokens with its state, is
-``Unsupported``.
+``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``). A request outside the contract, or
+with a question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
 """
 
 from __future__ import annotations

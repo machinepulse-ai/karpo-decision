@@ -17,9 +17,9 @@ import torch
 from .protocol import Request, validate
 from .templates import BlockTemplate
 
-#: Brackets that replace ``<`` and ``>`` of special and added tokens found in request text, so text can never yield a
-#: marker or a chat-template token.
-_ESCAPED = ("＜", "＞")
+#: Fullwidth brackets that replace ``<`` and ``>`` of special and added tokens found in request text, so text can never
+#: yield a marker or a chat-template token.
+_ESCAPED = ("\uff1c", "\uff1e")
 
 
 class LengthError(ValueError):

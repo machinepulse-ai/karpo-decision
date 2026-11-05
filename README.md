@@ -6,8 +6,7 @@ readout from a Gemma 4 backbone. It answers through `karpo_decision.decider.Deci
 [Decision Index](https://github.com/apolinario/decision-index) kit's suite with
 `karpo_decision.serve.engine:DecisionIndexEngine` (the kit installed separately).
 
-The released checkpoint is [MachinePulseAI/karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B)
-(Gemma 4 31B).
+Model: [MachinePulseAI/karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B).
 
 ## Install
 
@@ -15,8 +14,7 @@ The released checkpoint is [MachinePulseAI/karpo-decision-31B](https://huggingfa
 pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision"
 ```
 
-Python 3.12+. On Blackwell GPUs the `blackwell` extra adds Gemma's faster attention kernels (cuDNN, flash-attention 4);
-without it the memory-efficient and FlashAttention-2 paths serve.
+On Blackwell GPUs, the `blackwell` extra adds faster attention kernels.
 
 ## Use
 
@@ -37,20 +35,15 @@ response = decider.decide({
 print(response["answers"])
 ```
 
-The request contract is in `protocol.py`, the answer shapes in `answers.py`.
-
 ## Serving
 
 ```bash
 torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint <checkpoint dir> --port 18440
 ```
 
-The server runs on one GPU (`--nproc_per_node 1`). It listens on `127.0.0.1` unless `--host` says otherwise
-(`--host 0.0.0.0` accepts other machines); it checks no keys and speaks no TLS itself, so that address belongs behind
-something that does.
+It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 
-The image is `Dockerfile`: Python 3.12 and `requirements-serve.txt` (the pinned environment the model was evaluated
-in), then this package:
+With Docker:
 
 ```bash
 docker build -t karpo-decision .

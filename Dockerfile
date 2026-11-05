@@ -1,5 +1,3 @@
-# The serving image of a decision checkpoint, with the pinned dependencies of requirements-serve.txt. The command is
-# torchrun ... -m karpo_decision.serve.server, with the checkpoint mounted into the container (README).
 FROM python:3.12-slim
 
 # Triton builds its kernel launchers with the system C compiler at run time: torch.compile of Gemma's pointwise work

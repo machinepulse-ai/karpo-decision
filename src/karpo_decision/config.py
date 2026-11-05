@@ -17,7 +17,7 @@ ATTENTIONS = ("causal", "bidirectional")
 #: The readout marker of Gemma checkpoints (``families.gemma.MARKER``): an existing special token that request text
 #: can never produce.
 DEFAULT_MARKER = "<mask>"
-#: The most pixels of an image, a field of every checkpoint's config (the Gemma family reads text only).
+#: The most pixels of an image.
 DEFAULT_MAX_PIXELS = 1_638_400
 
 

@@ -1,0 +1,231 @@
+"""The packed forward pass over a Gemma 4 backbone's text layers (the dense 31B: 50 sliding-window layers, window
+1,024, head size 256; 10 global layers, head size 512, keys and values from one projection), over block layouts
+(``karpo-blocks-v1``, ``blocks.py``). Sequences laid end to end never attend across each other; the final hidden state
+is taken at the readout markers (each branch's last token). Training and serving both use it; it is differentiable.
+
+Attention follows Sieve-31B-v3's rule A, by segments (``Pack.segment_ids``) and positions (``Pack.seqpos``):
+- a sequence of one block (a request with one question) attends within itself: global layers bidirectionally (or
+  causally), sliding-window layers causally within the window;
+- in a branched sequence the shared block attends to itself only; a branch to the shared block and itself, never to
+  another branch. Global layers: bidirectionally within what a token may see (or causally, aligned at the end).
+  Sliding-window layers: causally within the window by position, so a branch sees the shared block's last 1,023
+  tokens before its own first token.
+
+``block_plan`` turns a pack into virtual sequences once (reused by every layer and by recomputation): every row is a
+query of exactly one virtual sequence, in pack order, and each virtual sequence gathers its keys (the shared block's
+rows, then its own) with ``index_select``, whose backward sums each branch's gradient into the shared rows. Sliding
+layers run one varlen flash-attention call with separate query and key boundaries and the window (1023, 0)
+(``sliding_attention``: flash-attention 4 on Blackwell, FlashAttention-2 elsewhere); global
+layers (head size beyond flash attention's 256) run cuDNN's FROST kernels per virtual sequence on Blackwell
+(``global_attention``), PyTorch's memory-efficient attention elsewhere. A bidirectional model computes its last layer
+(a global layer) only at the markers, each over its own virtual sequence.
+
+The layers are re-expressed with the backbone's own modules and weights (``Gemma4TextDecoderLayer``: sandwich norms,
+q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
+embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are refused.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
+
+from ...config import Attention
+from ...model.packed import Pack, PackedLayers
+from . import fused, global_attention, sliding_attention
+
+SLIDING, GLOBAL = "sliding_attention", "full_attention"
+
+
+@dataclass
+class BlockPlan:
+    """A pack's virtual sequences: query boundaries over the pack's rows, and per layer kind the key rows gathered
+    for each (global: the whole shared block; sliding: its last window - 1 rows), with their boundaries."""
+
+    q_cu: list[int]
+    q_cu_t: torch.Tensor
+    max_q: int
+    g_rows: torch.Tensor | None  # None: every virtual sequence's keys are its own rows (no branches)
+    g_cu: list[int]
+    s_rows: torch.Tensor | None
+    s_cu_t: torch.Tensor
+    max_s: int
+    m_cu: list[int]  # marker boundaries over the virtual sequences (markers in pack order)
+    g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
+    m_lens: torch.Tensor  # the same with the markers as queries
+
+
+def block_plan(p: Pack, window: int) -> BlockPlan:
+    """The virtual sequences of ``p``'s block layouts (``window``: the sliding layers' window, a token and the
+    window - 1 before it)."""
+    bounds = p.cu_cpu.tolist()
+    segments = p.segment_ids_cpu
+    q_cu, g_cu, s_cu = [0], [0], [0]
+    g_rows, s_rows = [], []
+    branched = False
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        seg = segments[a:b]
+        changes = ((seg[1:] != seg[:-1]).nonzero().flatten() + 1).tolist()
+        starts, ends = [0, *changes], [*changes, b - a]
+        labels = [int(seg[i]) for i in starts]
+        if labels[0] != 0 or labels[1:] != list(range(1, len(labels))):
+            raise ValueError(f"segments {labels} are not a shared block followed by branches 1, 2, ...")
+        shared = ends[0]
+        own = torch.arange(a, a + shared)
+        q_cu.append(a + shared)
+        g_rows.append(own)
+        s_rows.append(own)
+        g_cu.append(g_cu[-1] + shared)
+        s_cu.append(s_cu[-1] + shared)
+        tail = own[max(0, shared - (window - 1)):]
+        for start, end in zip(starts[1:], ends[1:], strict=True):
+            branched = True
+            rows = torch.arange(a + start, a + end)
+            q_cu.append(a + end)
+            g_rows.append(torch.cat([own, rows]))
+            s_rows.append(torch.cat([tail, rows]))
+            g_cu.append(g_cu[-1] + shared + len(rows))
+            s_cu.append(s_cu[-1] + len(tail) + len(rows))
+    device = p.input_ids.device
+    markers = p.markers.cpu()
+    m_cu = torch.searchsorted(markers, torch.tensor(q_cu)).tolist()
+    for qb, ma, mb in zip(q_cu[1:], m_cu[:-1], m_cu[1:], strict=True):
+        if mb - ma > 1 or (mb > ma and int(markers[ma]) != qb - 1):
+            raise ValueError("a block's readout marker must be its last token, one per branch")
+    lengths = [b - a for a, b in zip(q_cu[:-1], q_cu[1:], strict=True)]
+    s_lengths = [b - a for a, b in zip(s_cu[:-1], s_cu[1:], strict=True)]
+    return BlockPlan(
+        q_cu=q_cu, q_cu_t=torch.tensor(q_cu, dtype=torch.int32, device=device), max_q=max(lengths),
+        g_rows=torch.cat(g_rows).to(device) if branched else None, g_cu=g_cu,
+        s_rows=torch.cat(s_rows).to(device) if branched else None,
+        s_cu_t=torch.tensor(s_cu, dtype=torch.int32, device=device), max_s=max(s_lengths), m_cu=m_cu,
+        g_lens=global_attention.lengths(q_cu, g_cu, device), m_lens=global_attention.lengths(m_cu, g_cu, device))
+
+
+class Packed(PackedLayers):
+    """A Gemma 4 backbone's text layers over a ``Pack`` of block layouts; returns the normalized hidden state at every
+    marker."""
+
+    def __init__(self, backbone: Any, attention: Attention, checkpoint_every: int = 0, recompute: str = "layer",
+                 offload: bool = False, keep_every: int = 0, long_tokens: int = 0) -> None:
+        super().__init__(backbone.language_model.layers, checkpoint_every, recompute, offload, keep_every, long_tokens)
+        self.backbone = backbone
+        self.lm = backbone.language_model
+        config = self.lm.config
+        if config.hidden_size_per_layer_input or config.num_kv_shared_layers or config.enable_moe_block:
+            raise ValueError("per-layer embeddings, shared key-value layers and expert blocks are not supported")
+        if config.hidden_activation != "gelu_pytorch_tanh":
+            raise ValueError(f"the fused MLP is gelu_pytorch_tanh, not {config.hidden_activation}")
+        self.types = list(config.layer_types)
+        self.causal_global = attention == "causal"
+        self.window = config.sliding_window
+        self.sliding = (config.sliding_window - 1, 0)
+        self.prune_last = attention == "bidirectional"
+        if self.prune_last and self.types[-1] != GLOBAL:
+            raise ValueError("pruning the last layer needs a global last layer")
+
+    # ---------------------------------------------------------------- attention
+
+    @staticmethod
+    def _kv(attn: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(1, T, heads, head size) keys (normed, rotated) and values (normed) of every row."""
+        length, hd = x.shape[1], attn.head_dim
+        raw = attn.k_proj(x).view(1, length, -1, hd)
+        value = attn.v_proj(x).view(1, length, -1, hd) if attn.v_proj is not None else raw
+        return fused.norm_rope(attn.k_norm, raw, cos, sin), fused.norm(attn.v_norm, value)
+
+    @staticmethod
+    def _q(attn: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return fused.norm_rope(attn.q_norm, attn.q_proj(x).view(1, x.shape[1], -1, attn.head_dim), cos, sin)
+
+    @staticmethod
+    def _global(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_bounds: list[int], k_bounds: list[int],
+                lens: torch.Tensor, causal: bool, scale: float) -> torch.Tensor:
+        """Attention per virtual sequence: query rows [q_bounds[i], q_bounds[i+1]) over key rows
+        [k_bounds[i], k_bounds[i+1]) (``lens``: those lengths on the device); causal aligns the last query with the last
+        key (a branch's queries follow its shared keys); (rows, heads × head size)."""
+        outs = []
+        if global_attention.usable(query):
+            spans = zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True)
+            for i, (qa, qb, ka, kb) in enumerate(spans):
+                if qb > qa:
+                    outs.append(global_attention.attend(query[0, qa:qb], key[0, ka:kb], value[0, ka:kb], lens[i, 0, :1],
+                                                        lens[i, 1, :1], causal, scale))
+            out = torch.cat(outs)
+            return out.reshape(out.shape[0], -1)
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            for qa, qb, ka, kb in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:], strict=True):
+                if qb == qa:
+                    continue
+                q, k, v = (t[:, a:b].transpose(1, 2) for t, a, b in ((query, qa, qb), (key, ka, kb), (value, ka, kb)))
+                mask = causal_lower_right(qb - qa, kb - ka) if causal and qb - qa != kb - ka else None
+                outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale,
+                                                           is_causal=causal and mask is None,
+                                                           enable_gqa=k.shape[1] != q.shape[1]).transpose(1, 2))
+        out = torch.cat(outs, dim=1)
+        return out.reshape(out.shape[1], -1)
+
+    @staticmethod
+    def _gather(key: torch.Tensor, value: torch.Tensor, rows: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        if rows is None:
+            return key, value
+        return key.index_select(1, rows), value.index_select(1, rows)
+
+    def attention(self, attn: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, p: Pack) -> torch.Tensor:
+        plan = p.plan
+        query = self._q(attn, x, cos, sin)
+        key, value = self._kv(attn, x, cos, sin)
+        if attn.is_sliding:
+            key, value = self._gather(key, value, plan.s_rows)
+            out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
+                                           plan.max_s, attn.scaling, self.sliding[0])
+            out = out.reshape(x.shape[1], -1)
+        else:
+            key, value = self._gather(key, value, plan.g_rows)
+            out = self._global(query, key, value, plan.q_cu, plan.g_cu, plan.g_lens, self.causal_global, attn.scaling)
+        return attn.o_proj(out[None])
+
+    # ---------------------------------------------------------------- layers
+
+    @staticmethod
+    def _mlp(layer: Any, h: torch.Tensor) -> torch.Tensor:
+        x = fused.norm(layer.pre_feedforward_layernorm, h)
+        return fused.norm(layer.post_feedforward_layernorm, fused.mlp(layer.mlp, x))
+
+    def layer(self, layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, p: Pack) -> torch.Tensor:
+        attn = self.attention(layer.self_attn, fused.norm(layer.input_layernorm, h), cos, sin, p)
+        h = fused.residual_norm(h, layer.post_attention_layernorm, attn)
+        return fused.add_scale(h, self.mlp_branch(self._mlp, layer, h), layer.layer_scalar)
+
+    def last_layer_at_markers(self, layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                              p: Pack) -> torch.Tensor:
+        """The last (global) layer for the marker rows only: each over the keys of its own virtual sequence."""
+        plan = p.plan
+        attn = layer.self_attn
+        x = fused.norm(layer.input_layernorm, h)
+        query = self._q(attn, x[:, p.markers], cos[:, p.markers], sin[:, p.markers])
+        key, value = self._gather(*self._kv(attn, x, cos, sin), plan.g_rows)
+        out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)
+        hs = fused.residual_norm(h[:, p.markers], layer.post_attention_layernorm, attn.o_proj(out[None]))
+        return fused.add_scale(hs, self._mlp(layer, hs), layer.layer_scalar)
+
+    def forward(self, p: Pack) -> torch.Tensor:
+        """(M, hidden) final-normalized hidden states at the markers, in pack order."""
+        if p.cu_cpu is None or p.segment_ids_cpu is None:
+            raise ValueError("the Gemma family reads text-only block layouts (karpo-blocks-v1)")
+        p.plan = block_plan(p, self.window)
+        h = self.lm.embed_tokens(p.input_ids)[None]
+        rope = {t: self.lm.rotary_emb(h, p.seqpos[None], t) for t in set(self.types)}
+        last = len(self.layers) - 1 if self.prune_last else len(self.layers)
+        for index in range(last):
+            h = self.run(index, h, *rope[self.types[index]], p)
+        if self.prune_last:
+            h = self.layers[-1].packed_forward(h, *rope[self.types[-1]], p, markers_only=True)
+        else:
+            h = h[:, p.markers]
+        return self.lm.norm(h)[0]

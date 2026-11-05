@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "karpo-decision"
+version = "0.1.0"
+description = "Karpo's decision model, inference: typed System One decisions read out of a Gemma 4 backbone"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14",          # torch.nn.attention.varlen with window_size and enable_gqa
+    "transformers>=5.17",   # Gemma 4 (gemma4) backbones
+    "safetensors>=0.6",
+]
+
+[project.optional-dependencies]
+# Gemma's attention kernels on Blackwell: cuDNN's FROST engines (global layers, head size 512) and flash-attention 4
+# (sliding layers, head size 256, its generic d256 backward); without them the memory-efficient / FA2 paths serve.
+blackwell = ["nvidia-cudnn-frontend==1.32.1", "nvidia-cutlass-dsl==4.8.1", "apache-tvm-ffi==0.1.15.post2",
+             "flash-attn-4==4.0.0b37", "quack-kernels==0.6.5", "torch-c-dlpack-ext==0.1.5", "einops>=0.8"]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/karpo_decision"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a CUDA device"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

@@ -215,18 +215,33 @@ class Packed(PackedLayers):
         hs = fused.residual_norm(h[:, p.markers], layer.post_attention_layernorm, attn.o_proj(out[None]))
         return fused.add_scale(hs, self._mlp(layer, hs), layer.layer_scalar)
 
-    def forward(self, p: Pack) -> torch.Tensor:
-        """(M, hidden) final-normalized hidden states at the markers, in pack order."""
-        if p.cu_cpu is None or p.segment_ids_cpu is None:
-            raise ValueError("the Gemma family reads text-only block layouts (karpo-blocks-v1)")
-        p.plan = block_plan(p, self.window)
-        h = self.lm.embed_tokens(p.input_ids)[None]
-        rope = {t: self.lm.rotary_emb(h, p.seqpos[None], t) for t in set(self.types)}
-        last = len(self.layers) - 1 if self.prune_last else len(self.layers)
-        for index in range(last):
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """(1, T, hidden) scaled token embeddings."""
+        return self.lm.embed_tokens(input_ids)[None]
+
+    def rope(self, h: torch.Tensor, seqpos: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Per layer type, the rotary tables (cos, sin) at ``seqpos``."""
+        return {t: self.lm.rotary_emb(h, seqpos[None], t) for t in set(self.types)}
+
+    def body(self, h: torch.Tensor, rope: dict[str, tuple[torch.Tensor, torch.Tensor]], p: Pack) -> torch.Tensor:
+        """The layers that run on every token (all but the last in a bidirectional model)."""
+        for index in range(len(self.layers) - 1 if self.prune_last else len(self.layers)):
             h = self.run(index, h, *rope[self.types[index]], p)
+        return h
+
+    def head(self, h: torch.Tensor, rope: dict[str, tuple[torch.Tensor, torch.Tensor]], p: Pack) -> torch.Tensor:
+        """(M, hidden) final-normalized hidden states at the markers, in pack order."""
         if self.prune_last:
             h = self.layers[-1].packed_forward(h, *rope[self.types[-1]], p, markers_only=True)
         else:
             h = h[:, p.markers]
         return self.lm.norm(h)[0]
+
+    def forward(self, p: Pack) -> torch.Tensor:
+        """(M, hidden) final-normalized hidden states at the markers, in pack order."""
+        if p.cu_cpu is None or p.segment_ids_cpu is None:
+            raise ValueError("the Gemma family reads text-only block layouts (karpo-blocks-v1)")
+        p.plan = block_plan(p, self.window)
+        h = self.embed(p.input_ids)
+        rope = self.rope(h, p.seqpos)
+        return self.head(self.body(h, rope, p), rope, p)

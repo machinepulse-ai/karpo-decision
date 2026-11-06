@@ -5,8 +5,9 @@ process, one request at a time, and what the leaderboard's maintainers time.
         --option checkpoint=path/to/checkpoint --out runs/karpo-decision
 
 Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or ``reversed``: ``karpo_decision.views``);
-``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``). A request outside the contract, or
-with a question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
+``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false: the decoder
+projections in FP8, ``serve.fp8``; answers move by more than bf16 noise). A request outside the contract, or with a
+question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import LengthError
 from ..protocol import RequestError
 from ..views import VIEWS, joined, views
+from .fp8 import quantize
 
 
 class DecisionIndexEngine(Engine):
@@ -30,16 +32,20 @@ class DecisionIndexEngine(Engine):
                "readout and answers; excludes loading and warmup.")
 
     def __init__(self, checkpoint: str, view: str = "joint", max_length: int = DEFAULT_MAX_LENGTH,
-                 device: str = "cuda", **options: Any) -> None:
-        super().__init__(checkpoint=checkpoint, view=view, max_length=max_length, device=device, **options)
+                 device: str = "cuda", fp8: bool = False, **options: Any) -> None:
+        super().__init__(checkpoint=checkpoint, view=view, max_length=max_length, device=device, fp8=fp8, **options)
         if view not in VIEWS:
             raise ValueError(f"view must be one of {VIEWS}")
+        if not isinstance(fp8, bool):
+            raise ValueError(f"fp8 must be true or false, not {fp8!r}")
         if torch.device(device).index is not None:
             torch.cuda.set_device(torch.device(device))
         decider = Decider.from_pretrained(checkpoint, device=device, max_length=int(max_length))
+        if fp8:
+            quantize(decider.model)
         self.decider = decider
         self.view = view
-        self.path = "plain"
+        self.path = "fp8" if fp8 else "plain"
         self.provenance = {"kind": "decision-checkpoint", "checkpoint": checkpoint, "path": self.path, "view": view,
                            "template": decider.config.template, "attention": decider.config.attention}
         #: Milliseconds the last request spent in encoding (template, tokenizer, plan).

@@ -2,6 +2,7 @@
 and no weights: the loader is replaced."""
 
 import json
+import types
 
 import pytest
 
@@ -34,3 +35,13 @@ def test_gemma_refuses_more_than_one_gpu(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="one GPU"):
         server.load_decider(path, 2, "cuda:0")
 
+
+def test_fp8_quantizes_the_decoder_projections(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    decider = types.SimpleNamespace(model="packed")
+    quantized = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda model: quantized.append(model))
+    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+    assert quantized == ["packed"]

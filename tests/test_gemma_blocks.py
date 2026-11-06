@@ -27,11 +27,13 @@ TYPES = ["sliding_attention", "sliding_attention", "full_attention", "sliding_at
 
 def varlen_reference(q, k, v, cu_q, cu_k, max_q, max_k, scale=None, window_size=(-1, -1), enable_gqa=False):
     """varlen flash attention's contract: per sequence, query i sees key j when i + (Lk - Lq) - left <= j <= i + (Lk -
-    Lq) + right (right 0: causal, aligned at the end)."""
+    Lq) + right (right 0: causal, aligned at the end); empty sequences are skipped."""
     left, right = window_size
     outs = []
     for qa, qb, ka, kb in zip(cu_q[:-1].tolist(), cu_q[1:].tolist(), cu_k[:-1].tolist(), cu_k[1:].tolist(),
                               strict=True):
+        if qb == qa:
+            continue
         i = torch.arange(qb - qa, device=q.device)[:, None] + (kb - ka) - (qb - qa)
         j = torch.arange(kb - ka, device=q.device)[None, :]
         mask = (j <= i + right) & (j >= i - left)

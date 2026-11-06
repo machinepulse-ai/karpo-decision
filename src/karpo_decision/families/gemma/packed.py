@@ -19,6 +19,8 @@ layers run one varlen flash-attention call with separate query and key boundarie
 layers (head size beyond flash attention's 256) run cuDNN's FROST kernels per virtual sequence on Blackwell
 (``global_attention``), PyTorch's memory-efficient attention elsewhere. A bidirectional model computes its last layer
 (a global layer) only at the markers, each over its own virtual sequence.
+A pack padded for a CUDA graph (``PaddedPlan``: one single-block sequence and its padding) runs its global layers as one
+varlen memory-efficient call (``global_attention.padded``).
 
 The layers are re-expressed with the backbone's own modules and weights (``Gemma4TextDecoderLayer``: sandwich norms,
 q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
@@ -58,6 +60,33 @@ class BlockPlan:
     m_cu: list[int]  # marker boundaries over the virtual sequences (markers in pack order)
     g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
     m_lens: torch.Tensor  # the same with the markers as queries
+
+
+@dataclass
+class PaddedPlan:
+    """One single-block sequence of L rows padded to ``size`` rows (``serve.graphs``): the real rows and the padding are
+    two sequences for attention, ``cu`` = [0, L, size] on the device."""
+
+    cu: torch.Tensor
+    size: int
+    g_rows: None = None
+    s_rows: None = None
+
+    @property
+    def q_cu_t(self) -> torch.Tensor:
+        return self.cu
+
+    @property
+    def s_cu_t(self) -> torch.Tensor:
+        return self.cu
+
+    @property
+    def max_q(self) -> int:
+        return self.size
+
+    @property
+    def max_s(self) -> int:
+        return self.size
 
 
 def block_plan(p: Pack, window: int) -> BlockPlan:
@@ -186,6 +215,9 @@ class Packed(PackedLayers):
             key, value = self._gather(key, value, plan.s_rows)
             out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
                                            plan.max_s, attn.scaling, self.sliding[0])
+            out = out.reshape(x.shape[1], -1)
+        elif isinstance(plan, PaddedPlan):
+            out = global_attention.padded(query, key, value, plan.cu, plan.size, self.causal_global, attn.scaling)
             out = out.reshape(x.shape[1], -1)
         else:
             key, value = self._gather(key, value, plan.g_rows)

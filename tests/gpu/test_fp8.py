@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from karpo_decision.families.gemma import fused
 from karpo_decision.families.gemma import packed as gp
 from karpo_decision.model.packed import pack
 from karpo_decision.serve import fp8
@@ -59,3 +60,49 @@ def test_quantize_replaces_every_projection_with_one_near_its_bf16_linear():
             assert ((replaced(x).float() - y).norm() / y.norm()) < 0.05, path
         got = packed(pack(seqs, None, GPU)).float()
     assert got.shape == want.shape and torch.isfinite(got).all()
+
+
+def test_quantized_rows_index_like_the_activation():
+    torch.manual_seed(0)
+    x = torch.randn(1, 9, 64, device=GPU, dtype=torch.bfloat16)
+    q = fp8.Quantized.of(x)
+    rows = torch.tensor([2, 8], device=GPU)
+    part, want = q[:, rows], fp8.Quantized.of(x[:, rows])
+    assert part.shape == (1, 2, 64) and torch.equal(part.scale, want.scale)
+    assert torch.equal(part.values.view(torch.uint8), want.values.view(torch.uint8))
+
+
+def test_fused_quantization_matches_quantizing_the_op_output():
+    torch.manual_seed(0)
+    lm = build_tiny().to(GPU, torch.bfloat16)
+    layer = lm.layers[0]
+    h = torch.randn(1, 13, lm.config.hidden_size, device=GPU, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        got = fp8.norm(layer.input_layernorm, h)
+        want = fp8.Quantized.of(fused.norm(layer.input_layernorm, h))
+        assert got.shape == want.shape and got.dtype == want.dtype
+        torch.testing.assert_close(got.scale, want.scale, rtol=1e-2, atol=0)
+        assert (got.values.float() != want.values.float()).float().mean() < 1e-2  # rare rounding flips at most
+        x = fp8.norm(layer.pre_feedforward_layernorm, h)
+        plain = fused.mlp(layer.mlp, fused.norm(layer.pre_feedforward_layernorm, h)).float()
+        fp8.quantize(types.SimpleNamespace(layers=[layer]))
+        quantized = fp8.mlp(layer.mlp, x).float()
+    assert ((quantized - plain).norm() / plain.norm()) < 0.1  # three e4m3 roundings in a row, each near 0.04
+
+
+def test_each_activation_is_quantized_once():
+    torch.manual_seed(0)
+    lm = build_tiny().to(GPU, torch.bfloat16)
+    packed = gp.Packed(types.SimpleNamespace(language_model=lm), "bidirectional")
+    torch.manual_seed(1)
+    seqs = [cpu.sequence(13, []), cpu.sequence(11, [5, 7])]
+    fp8.quantize(packed)
+    assert packed.norm_input is fp8.norm and packed.mlp is fp8.mlp
+    calls = []
+    real = fp8.Quantized.of
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(fp8.Quantized, "of", staticmethod(lambda x: calls.append(x.shape) or real(x)))
+        with torch.inference_mode():
+            out = packed(pack(seqs, None, GPU))
+    assert len(calls) == len(cpu.TYPES)  # o_proj's input only; q/k/v, gate/up and down read the fused quantization
+    assert out.isfinite().all()

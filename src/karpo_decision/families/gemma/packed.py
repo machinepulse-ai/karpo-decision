@@ -128,6 +128,8 @@ class Packed(PackedLayers):
         self.prune_last = attention == "bidirectional"
         if self.prune_last and self.types[-1] != GLOBAL:
             raise ValueError("pruning the last layer needs a global last layer")
+        #: The norm before a layer's attention and MLP, and the MLP; ``serve.fp8.quantize`` swaps in quantizing ones.
+        self.norm_input, self.mlp = fused.norm, fused.mlp
 
     # ---------------------------------------------------------------- attention
 
@@ -192,13 +194,12 @@ class Packed(PackedLayers):
 
     # ---------------------------------------------------------------- layers
 
-    @staticmethod
-    def _mlp(layer: Any, h: torch.Tensor) -> torch.Tensor:
-        x = fused.norm(layer.pre_feedforward_layernorm, h)
-        return fused.norm(layer.post_feedforward_layernorm, fused.mlp(layer.mlp, x))
+    def _mlp(self, layer: Any, h: torch.Tensor) -> torch.Tensor:
+        x = self.norm_input(layer.pre_feedforward_layernorm, h)
+        return fused.norm(layer.post_feedforward_layernorm, self.mlp(layer.mlp, x))
 
     def layer(self, layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, p: Pack) -> torch.Tensor:
-        attn = self.attention(layer.self_attn, fused.norm(layer.input_layernorm, h), cos, sin, p)
+        attn = self.attention(layer.self_attn, self.norm_input(layer.input_layernorm, h), cos, sin, p)
         h = fused.residual_norm(h, layer.post_attention_layernorm, attn)
         return fused.add_scale(h, self.mlp_branch(self._mlp, layer, h), layer.layer_scalar)
 
@@ -207,7 +208,7 @@ class Packed(PackedLayers):
         """The last (global) layer for the marker rows only: each over the keys of its own virtual sequence."""
         plan = p.plan
         attn = layer.self_attn
-        x = fused.norm(layer.input_layernorm, h)
+        x = self.norm_input(layer.input_layernorm, h)
         query = self._q(attn, x[:, p.markers], cos[:, p.markers], sin[:, p.markers])
         key, value = self._gather(*self._kv(attn, x, cos, sin), plan.g_rows)
         out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)

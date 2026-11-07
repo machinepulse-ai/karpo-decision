@@ -1,7 +1,12 @@
-"""FP8 projections on GPU: an ``Fp8Linear`` stays near its bf16 ``Linear``; ``quantize`` replaces every decoder
-projection of a tiny random Gemma 4, each staying near the bf16 ``Linear`` it replaced on the input that ``Linear``
-gets in a packed forward, and the quantized forward runs. Its output is not compared with bf16's: the random model
-amplifies any rounding."""
+"""FP8 on GPU, with a tiny random Gemma 4 for the packed forward:
+- an ``Fp8Linear`` stays near its bf16 ``Linear``;
+- ``quantize`` replaces every decoder projection, each staying near the bf16 ``Linear`` it replaced on the input that
+  ``Linear`` gets in a packed forward, and the quantized forward runs; its output is not compared with bf16's: the
+  random model amplifies any rounding;
+- a ``Quantized`` activation indexes by rows like the activation;
+- the fused norm and gelu_mul quantizations match quantizing the plain op's output, and the quantized MLP stays near
+  the plain one;
+- a packed forward quantizes only each ``o_proj``'s input outside the fused ops, once per layer."""
 
 import sys
 import types
@@ -83,6 +88,12 @@ def test_fused_quantization_matches_quantizing_the_op_output():
         assert got.shape == want.shape and got.dtype == want.dtype
         torch.testing.assert_close(got.scale, want.scale, rtol=1e-2, atol=0)
         assert (got.values.float() != want.values.float()).float().mean() < 1e-2  # rare rounding flips at most
+        gate, up = (torch.randn(1, 13, 1024, device=GPU, dtype=torch.bfloat16) for _ in range(2))
+        values, scale = fp8.gelu_mul_e4m3(gate, up)
+        want = fp8.Quantized.of(fused.gelu_mul(gate, up))
+        assert values.shape == want.values.shape
+        torch.testing.assert_close(scale, want.scale, rtol=1e-2, atol=0)
+        assert (values.float() != want.values.float()).float().mean() < 1e-2  # rare rounding flips at most
         x = fp8.norm(layer.pre_feedforward_layernorm, h)
         plain = fused.mlp(layer.mlp, fused.norm(layer.pre_feedforward_layernorm, h)).float()
         fp8.quantize(types.SimpleNamespace(layers=[layer]))
@@ -105,4 +116,5 @@ def test_each_activation_is_quantized_once():
         with torch.inference_mode():
             out = packed(pack(seqs, None, GPU))
     assert len(calls) == len(cpu.TYPES)  # o_proj's input only; q/k/v, gate/up and down read the fused quantization
+    assert sorted(s[-1] for s in calls) == sorted(layer.self_attn.o_proj.in_features for layer in lm.layers)
     assert out.isfinite().all()

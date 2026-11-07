@@ -61,10 +61,10 @@ def _shapes(*tensors: Any) -> None:
                     torch._dynamo.mark_static(t, d)
 
 
-def _on_gpu(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
-    compiled = torch.compile(fn)
+def _on_gpu[T](fn: Callable[..., T], **options: Any) -> Callable[..., T]:
+    compiled = torch.compile(fn, options=options or None)
 
-    def run(x: torch.Tensor, *args: Any) -> torch.Tensor:
+    def run(x: torch.Tensor, *args: Any) -> T:
         if not x.is_cuda:
             return fn(x, *args)
         _shapes(x, *args)

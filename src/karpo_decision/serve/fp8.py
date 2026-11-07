@@ -24,12 +24,13 @@ def _to_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3), scale
 
 
-_compiled = torch.compile(_to_e4m3, dynamic=True)
+def _rows_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_to_e4m3`` over the rows of an activation (..., K)."""
+    return _to_e4m3(x.reshape(-1, x.shape[-1]))
 
 
-def to_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``_to_e4m3`` in one fused kernel on GPU."""
-    return _compiled(x) if x.is_cuda else _to_e4m3(x)
+#: Like ``fused``'s ops, in one kernel on GPU, compiled for static widths with only the sequence (dimension 1) dynamic.
+to_e4m3 = fused._on_gpu(_rows_e4m3)
 
 
 @dataclass
@@ -43,7 +44,8 @@ class Quantized:
 
     @staticmethod
     def of(x: torch.Tensor) -> Quantized:
-        values, scale = to_e4m3(x.reshape(-1, x.shape[-1]))
+        """``x`` is (1, T, K): the sequence, dimension 1, is the only dimension compiled as dynamic."""
+        values, scale = to_e4m3(x)
         return Quantized(values, scale, x.shape, x.dtype)
 
     def __getitem__(self, index: tuple) -> Quantized:
@@ -53,31 +55,31 @@ class Quantized:
 
 
 def _norm_e4m3(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    y = fused._rms_norm(x, weight, eps)
-    return _to_e4m3(y.reshape(-1, y.shape[-1]))
+    return _rows_e4m3(fused._rms_norm(x, weight, eps))
 
 
 def _gelu_mul_e4m3(gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    y = fused._gelu_mul(gate, up)
-    return _to_e4m3(y.reshape(-1, y.shape[-1]))
+    """``fused.gelu_mul``'s result quantized by row; computed in float32 and rounded once, as the compiled op does."""
+    return _rows_e4m3(fused._gelu_mul(gate.float(), up.float()).to(gate.dtype))
 
 
-#: Eager's bf16 rounding of the op output is kept before the scale, as when the projection quantized it.
-_norm_compiled = torch.compile(_norm_e4m3, dynamic=True, options={"emulate_precision_casts": True})
-_gelu_mul_compiled = torch.compile(_gelu_mul_e4m3, dynamic=True, options={"emulate_precision_casts": True})
+#: ``emulate_precision_casts`` keeps the bf16 rounding of the op output before the scale, as when the projection
+#: quantized it.
+norm_e4m3 = fused._on_gpu(_norm_e4m3, emulate_precision_casts=True)
+gelu_mul_e4m3 = fused._on_gpu(_gelu_mul_e4m3, emulate_precision_casts=True)
 
 
 def norm(module: Any, x: torch.Tensor) -> Quantized:
     """A ``Gemma4RMSNorm`` applied to ``x`` and its rows quantized, in one kernel."""
     weight = module.weight if module.with_scale else None
-    values, scale = (_norm_compiled if x.is_cuda else _norm_e4m3)(x, weight, module.eps)
+    values, scale = norm_e4m3(x, weight, module.eps)
     return Quantized(values, scale, x.shape, x.dtype)
 
 
 def mlp(module: Any, x: Quantized) -> torch.Tensor:
     """A ``Gemma4TextMLP`` over a quantized input; ``down_proj``'s input is quantized as the gate is applied."""
     gate, up = module.gate_proj(x), module.up_proj(x)
-    values, scale = (_gelu_mul_compiled if gate.is_cuda else _gelu_mul_e4m3)(gate, up)
+    values, scale = gelu_mul_e4m3(gate, up)
     return module.down_proj(Quantized(values, scale, gate.shape, gate.dtype))
 
 
@@ -101,7 +103,8 @@ class Fp8Linear(torch.nn.Module):
 
 def quantize(model: torch.nn.Module) -> int:
     """Every decoder layer's projections to ``Fp8Linear``, in place, a layer at a time (each layer's bf16 weights freed
-    as it goes). Returns how many were replaced."""
+    as it goes), and ``norm`` and ``mlp`` as the ``norm_input`` and ``mlp`` hooks of ``model`` (a ``Packed``). Returns
+    how many projections were replaced."""
     replaced = 0
     for layer in model.layers:
         for parent in list(layer.modules()):

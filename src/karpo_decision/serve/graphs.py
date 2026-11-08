@@ -16,8 +16,8 @@ from ..families.gemma import global_attention, sliding_attention
 from ..families.gemma.packed import Packed, PaddedPlan, block_plan
 from ..model.packed import Pack
 
-#: Bucket step: matrix products on the RTX PRO 6000 take whole 128-row tiles, so padding within one costs nothing.
-STEP = 128
+#: Bucket step: fine enough that padding costs little GEMM work.
+STEP = 32
 #: The longest sequence with a graph; a longer one gains little (its GPU time dwarfs the launches) and runs plain.
 MAX_TOKENS = 8192
 #: Passes before a capture: the first compiles and tunes kernels for the bucket's length.

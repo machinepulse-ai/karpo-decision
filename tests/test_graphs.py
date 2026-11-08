@@ -42,7 +42,7 @@ def test_graphs_answer_like_the_plain_forward(model, kernels, attention):  # noq
     g = graphs.Graphs(packed, max_tokens=256)
     plain_forward, calls = packed.forward, []
     packed.forward = lambda p: calls.append(p) or plain_forward(p)
-    layouts = [[sequence(13, [])], [sequence(128, [])], [sequence(129, [])],  # padded: 128, 128 (no padding), 256
+    layouts = [[sequence(13, [])], [sequence(128, [])], [sequence(129, [])],  # padded: 32, 128 (no padding), 160
                [sequence(300, [])], [sequence(11, [5, 7])], [sequence(9, []), sequence(5, [])]]  # plain
     with torch.no_grad():
         for seqs in layouts:

@@ -22,7 +22,8 @@ STEP = 32
 MAX_TOKENS = 8192
 #: Passes before a capture: the first compiles and tunes kernels for the bucket's length.
 WARMUP = 2
-#: Answered once after capture, so the first request compiles nothing.
+#: Answered before capture, so the fused kernels compile on it as on the plain path (a kernel's reduction order follows
+#: the shapes of its first call), and once after, so the first request compiles nothing.
 WARMUP_REQUEST = {"state": {"page": {"url": "about:blank"}},
                   "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
 
@@ -122,6 +123,7 @@ def fast(decider: Decider, max_tokens: int = MAX_TOKENS) -> bool:
     the ``blackwell`` extra's kernels would run."""
     if decider.device.type != "cuda" or not kernels_supported(decider.device):
         return False
+    decider.decide(WARMUP_REQUEST)
     graphs = Graphs(decider.model, min(max_tokens, decider.max_length))
     with torch.cuda.device(decider.device):
         graphs.capture_all()

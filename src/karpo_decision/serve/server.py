@@ -49,8 +49,7 @@ def log(**fields: Any) -> None:
 
 def text_warmup_request() -> Request:
     """A tiny request without images, for a family that reads text only (Gemma)."""
-    return {"state": {"page": {"url": "about:blank"}},
-            "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
+    return graphs.WARMUP_REQUEST
 
 
 def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,

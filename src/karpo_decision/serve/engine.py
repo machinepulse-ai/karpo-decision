@@ -47,6 +47,7 @@ class DecisionIndexEngine(Engine):
         decider = Decider.from_pretrained(checkpoint, device=device, max_length=int(max_length))
         if fp8:
             quantize(decider.model)
+            decider.decide(graphs.WARMUP_REQUEST)  # the fused kernels compile on it with or without graphs
         graphed = fp8 and fast and graphs.fast(decider)
         self.decider = decider
         self.view = view

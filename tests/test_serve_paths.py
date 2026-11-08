@@ -26,7 +26,7 @@ def test_gemma_serves_on_one_gpu_through_the_plain_path(tmp_path, monkeypatch):
                                     or "plain"))
     decider, warmup = server.load_decider(path, 1, "cuda:0")
     assert decider == "plain" and calls == [(path, "cuda:0")]
-    assert images_of(warmup)[1] == []
+    assert warmup is server.graphs.WARMUP_REQUEST and images_of(warmup)[1] == []
 
 
 def test_gemma_refuses_more_than_one_gpu(tmp_path, monkeypatch):

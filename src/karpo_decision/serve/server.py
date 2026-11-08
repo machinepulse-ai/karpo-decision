@@ -10,7 +10,8 @@ passes, one request at a time. The ``Server-Timing`` header gives the request's 
 model (passes, readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
 
 A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
-its decoder projections in FP8 with ``--fp8`` (``serve.fp8``), warmed up with a text request, since Gemma reads text
+its decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
+captured at load (``serve.graphs``; ``--no-fast`` skips them), warmed up with a text request, since Gemma reads text
 only.
 """
 
@@ -34,6 +35,7 @@ import torch.distributed as dist
 from ..decider import Decider
 from ..encoding import Encoded
 from ..protocol import Request, RequestError, images_of
+from . import graphs
 from .fp8 import quantize
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -51,14 +53,18 @@ def text_warmup_request() -> Request:
             "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False) -> tuple[Decider, Request]:
+def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,
+                 fast: bool = True) -> tuple[Decider, Request]:
     """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs the plain path on one GPU, its
-    decoder projections in FP8 when ``fp8`` is true, and reads text only."""
+    decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests
+    replay CUDA graphs unless ``fast`` is false."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     decider = Decider.from_pretrained(checkpoint, device=device)
     if fp8:
         quantize(decider.model)
+        if fast:
+            graphs.fast(decider)
     return decider, text_warmup_request()
 
 
@@ -207,6 +213,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
     parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
+    parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
@@ -217,7 +224,7 @@ def main() -> None:
     # timeout would end them after the first quiet half hour.
     control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device, fp8=args.fp8)
+    decider, warmup = load_decider(args.checkpoint, world, device, fp8=args.fp8, fast=not args.no_fast)
     loaded = time.time()
     decider.decide(warmup)
     ranks = Ranks(decider, control, device)
@@ -225,7 +232,7 @@ def main() -> None:
         ranks.follow()
         os._exit(0)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
-            "path": "fp8" if args.fp8 else "plain"}
+            "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain"}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()

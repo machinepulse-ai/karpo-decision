@@ -36,12 +36,33 @@ def test_gemma_refuses_more_than_one_gpu(tmp_path, monkeypatch):
         server.load_decider(path, 2, "cuda:0")
 
 
-def test_fp8_quantizes_the_decoder_projections(tmp_path, monkeypatch):
+def test_fp8_quantizes_the_decoder_projections_then_captures_graphs(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    decider = types.SimpleNamespace(model="packed")
+    calls = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda model: calls.append(("fp8", model)))
+    monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
+    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+    assert calls == [("fp8", "packed"), ("fast", decider)]
+
+
+def test_fp8_without_fast_captures_no_graphs(tmp_path, monkeypatch):
     path = checkpoint(tmp_path, "gemma4")
     decider = types.SimpleNamespace(model="packed")
     quantized = []
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda model: quantized.append(model))
-    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+    monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
+    assert server.load_decider(path, 1, "cuda:0", fp8=True, fast=False)[0] is decider
     assert quantized == ["packed"]
+
+
+def test_without_fp8_no_graphs_are_captured(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: "plain"))
+    monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
+    assert server.load_decider(path, 1, "cuda:0")[0] == "plain"

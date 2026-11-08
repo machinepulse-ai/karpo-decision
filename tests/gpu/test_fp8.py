@@ -32,7 +32,7 @@ GPU = torch.device("cuda")
 def test_fp8_linear_stays_near_bf16():
     torch.manual_seed(0)
     linear = torch.nn.Linear(512, 1024, bias=False, device=GPU, dtype=torch.bfloat16)
-    x = torch.randn(37, 512, device=GPU, dtype=torch.bfloat16)
+    x = torch.randn(1, 37, 512, device=GPU, dtype=torch.bfloat16)
     want = linear(x).float()
     got = fp8.Fp8Linear(linear)(x).float()
     assert ((got - want).norm() / want.norm()) < 0.05

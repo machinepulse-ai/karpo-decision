@@ -42,7 +42,8 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 ```
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
-`--fp8` runs the decoder projections in FP8: faster, answers move by more than bf16 noise.
+`--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
+at startup (a few minutes) for single-question requests; `--no-fast` skips the graphs.
 
 With Docker:
 
@@ -59,7 +60,7 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
     --option checkpoint=<checkpoint dir> --out runs/karpo-decision-31B
 ```
 
-`--option fp8=true` does the same.
+`--option fp8=true` does the same (`--option fast=false` without the graphs).
 
 ## Layout
 

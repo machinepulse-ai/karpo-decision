@@ -1,5 +1,6 @@
-"""Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain and text only. No GPU
-and no weights: the loader is replaced."""
+"""Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain by default, FP8
+projections with ``fp8``, then CUDA graphs unless ``fast`` is false, warmed up with the graphs' warmup request (text
+only). No GPU and no weights: the loader, the quantization and the capture are replaced."""
 
 import json
 import types

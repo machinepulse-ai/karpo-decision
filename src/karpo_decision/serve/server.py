@@ -9,10 +9,10 @@ reaches the other ranks; it hands the encoded sequences to them over a CPU (gloo
 passes, one request at a time. The ``Server-Timing`` header gives the request's encode, share (the hand-over) and
 model (passes, readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
-its decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
-captured at load (``serve.graphs``; ``--no-fast`` skips them), warmed up with a text request, since Gemma reads text
-only.
+A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
+FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
+(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
+request, since Gemma reads text only.
 """
 
 from __future__ import annotations
@@ -54,9 +54,9 @@ def text_warmup_request() -> Request:
 
 def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,
                  fast: bool = True) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs the plain path on one GPU, its
-    decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests
-    replay CUDA graphs unless ``fast`` is false."""
+    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on one GPU, its decoder projections
+    in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
+    ``fast`` is false or the ``blackwell`` extra's kernels run."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     decider = Decider.from_pretrained(checkpoint, device=device)

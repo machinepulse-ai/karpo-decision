@@ -43,7 +43,8 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
-at startup (a few minutes) for single-question requests; `--no-fast` skips the graphs.
+at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
+the graphs.
 
 With Docker:
 
@@ -60,7 +61,7 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
     --option checkpoint=<checkpoint dir> --out runs/karpo-decision-31B
 ```
 
-`--option fp8=true` does the same (`--option fast=false` without the graphs).
+`--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them).
 
 ## Layout
 
@@ -74,7 +75,7 @@ src/karpo_decision/
   decider.py               answering: encode, pack, one forward pass per pack, read out
   views.py                 other readings of a request (single, reversed) and how their answers join
   model/ families/         the packed forward pass and the readout; the Gemma 4 backbone (families/gemma)
-  serve/                   the HTTP server and the Decision Index kit's engine
+  serve/                   the HTTP server, the Decision Index kit's engine, the FP8 projections and the CUDA graphs
 ```
 
 ## Tests

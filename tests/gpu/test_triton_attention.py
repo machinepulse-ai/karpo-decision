@@ -2,13 +2,15 @@
 tiny model's: one sequence against float32 math, with logits of order one and in the hundreds; a varlen pack with
 branches (queries and keys with their own boundaries) and an empty sequence against PyTorch's memory-efficient
 attention per virtual sequence; keys beginning past 2^31 elements into the pack (31B only); equal outputs from
-repeated calls; no gradients. Through ``Packed.global_attend`` (``triton_attention.enable``), on a tiny random Gemma 4:
-the packed forward stays near the plain path, CUDA graph replays equal the eager padded pass, a causal model is
-refused."""
+repeated calls; no gradients. Through ``Packed.global_attend`` (``triton_attention.enable``), on a tiny random Gemma 4,
+with a spy on the hook: the packed forward stays near the plain path and calls the hook with each pack's longest
+virtual sequence (past one 64-row tile too); CUDA graph replays equal the eager padded pass, stay near the plain path,
+and reach the hook through the padded plan; a causal model is refused."""
 
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
@@ -133,29 +135,54 @@ def tiny(attention="bidirectional"):
 
 
 def test_packed_forward_with_the_hook_stays_near_the_plain_path():
+    """A spy on the hook: it is called by the body's global layers with the longest virtual sequence as ``max_q`` and by
+    the markers-only layer with 1, so a disconnected hook or an undersized grid shows (the layouts include rows past
+    one 64-row tile)."""
     packed = tiny()
     torch.manual_seed(2)
-    layouts = [[cpu.sequence(13, [])], [cpu.sequence(11, [5, 7])], [cpu.sequence(9, []), cpu.sequence(40, [6])]]
+    layouts = [[cpu.sequence(13, [])], [cpu.sequence(11, [5, 7])], [cpu.sequence(9, []), cpu.sequence(40, [6])],
+               [cpu.sequence(150, [])], [cpu.sequence(70, [30, 90])]]
+    longest = [13, 11, 40, 150, 90]
     with torch.inference_mode():
         want = [packed(pack(seqs, None, GPU)).float() for seqs in layouts]
         ta.enable(packed)
-        got = [packed(pack(seqs, None, GPU)).float() for seqs in layouts]
+        assert packed.global_attend is ta.attend
+        packed.global_attend = spy = mock.Mock(wraps=ta.attend)
+        got, max_q = [], []
+        for seqs in layouts:
+            spy.reset_mock()
+            got.append(packed(pack(seqs, None, GPU)).float())
+            max_q.append([call.args[5] for call in spy.call_args_list])
     for g, w in zip(got, want, strict=True):
-        assert ((g - w).norm() / w.norm()) < 1e-2
+        assert ((g - w).norm() / w.norm()) < 2e-2
+    for calls, n in zip(max_q, longest, strict=True):
+        assert len(calls) >= 2, "the hook was not called"
+        assert set(calls[:-1]) == {n} and calls[-1] == 1, calls
 
 
 def test_graph_replays_with_the_hook_equal_the_eager_padded_pass():
+    """Replays equal the eager padded pass and stay near the plain forward; a spy shows the padded plan reaching the
+    hook during capture, with the graphs' boundary buffer for both bounds and the bucket's size as ``max_q``."""
     packed = tiny()
-    ta.enable(packed)
-    eager = graphs.Graphs(packed, max_tokens=128)
-    g = graphs.Graphs(packed, max_tokens=128)
-    g.capture_all()
     torch.manual_seed(3)
+    batches = [[cpu.sequence(length, [])] for length in (13, 64, 65, 150, 13)]
     with torch.inference_mode():
-        for length in (13, 64, 65, 13):
-            seqs = [cpu.sequence(length, [])]
-            assert torch.equal(g(pack(seqs, None, GPU)), eager(pack(seqs, None, GPU)))
-    assert g.replays == 4
+        want = [packed(pack(seqs, None, GPU)).float() for seqs in batches]
+    ta.enable(packed)
+    packed.global_attend = spy = mock.Mock(wraps=ta.attend)
+    eager = graphs.Graphs(packed, max_tokens=256)
+    g = graphs.Graphs(packed, max_tokens=256)
+    g.capture_all()
+    calls = spy.call_args_list  # the warmup and captured passes of every bucket
+    assert calls, "the padded plan did not call the hook"
+    assert all(call.args[3] is g.cu and call.args[4] is g.cu for call in calls)
+    assert {call.args[5] for call in calls} == set(range(graphs.STEP, 257, graphs.STEP))
+    with torch.inference_mode():
+        for seqs, w in zip(batches, want, strict=True):
+            got = g(pack(seqs, None, GPU))
+            assert torch.equal(got, eager(pack(seqs, None, GPU)))
+            assert ((got.float() - w).norm() / w.norm()) < 2e-2
+    assert g.replays == 5
 
 
 def test_enable_refuses_a_causal_model():

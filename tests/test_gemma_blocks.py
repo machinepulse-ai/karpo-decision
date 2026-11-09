@@ -154,3 +154,18 @@ def test_the_plan_refuses_scrambled_segments(model):
     bad = Encoded(**{**s.__dict__, "segment_ids": torch.tensor([0] * 6 + [2] * 3 + [1] * 3, dtype=torch.int16)})
     with pytest.raises(ValueError):
         gp.block_plan(pack([bad], None, torch.device("cpu")), WINDOW)
+
+
+def test_the_plan_holds_the_global_bounds_on_the_device():
+    """``g_cu_t`` and ``m_cu_t`` (the bounds ``Packed.global_attend`` reads) exist when ``block_plan`` returns: built
+    later, mid-forward, their host-to-device copy would wait for the GPU work queued before it. Without branches the
+    keys' bounds are the queries' own tensor."""
+    device = torch.device("cpu")
+    plain = gp.block_plan(pack([sequence(9, []), sequence(5, [])], None, device), WINDOW)
+    branched = gp.block_plan(pack([sequence(9, []), sequence(11, [5, 7])], None, device), WINDOW)
+    for plan in (plain, branched):
+        assert {"g_cu_t", "m_cu_t"} <= vars(plan).keys()
+        assert plan.g_cu_t.dtype == plan.m_cu_t.dtype == torch.int32
+        assert plan.g_cu_t.tolist() == plan.g_cu and plan.m_cu_t.tolist() == plan.m_cu
+    assert plain.g_cu_t is plain.q_cu_t
+    assert branched.g_cu_t is not branched.q_cu_t

@@ -30,7 +30,7 @@ embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are 
 
 from __future__ import annotations
 
-import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,22 +56,14 @@ class BlockPlan:
     max_q: int
     g_rows: torch.Tensor | None  # None: every virtual sequence's keys are its own rows (no branches)
     g_cu: list[int]
+    g_cu_t: torch.Tensor  # g_cu on the device (``Packed.global_attend``); q_cu_t itself without branches
     s_rows: torch.Tensor | None
     s_cu_t: torch.Tensor
     max_s: int
     m_cu: list[int]  # marker boundaries over the virtual sequences (markers in pack order)
+    m_cu_t: torch.Tensor  # m_cu on the device
     g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
     m_lens: torch.Tensor  # the same with the markers as queries
-
-    @functools.cached_property
-    def g_cu_t(self) -> torch.Tensor:
-        """``g_cu`` on the device (``Packed.global_attend``)."""
-        return torch.tensor(self.g_cu, dtype=torch.int32, device=self.q_cu_t.device)
-
-    @functools.cached_property
-    def m_cu_t(self) -> torch.Tensor:
-        """``m_cu`` on the device."""
-        return torch.tensor(self.m_cu, dtype=torch.int32, device=self.q_cu_t.device)
 
 
 @dataclass
@@ -103,7 +95,8 @@ class PaddedPlan:
 
 def block_plan(p: Pack, window: int) -> BlockPlan:
     """The virtual sequences of ``p``'s block layouts (``window``: the sliding layers' window, a token and the
-    window - 1 before it)."""
+    window - 1 before it). Its device tensors are all built here, before any layer is queued: a host-to-device copy
+    made mid-forward waits for the GPU work ahead of it."""
     bounds = p.cu_cpu.tolist()
     segments = p.segment_ids_cpu
     q_cu, g_cu, s_cu = [0], [0], [0]
@@ -140,11 +133,14 @@ def block_plan(p: Pack, window: int) -> BlockPlan:
             raise ValueError("a block's readout marker must be its last token, one per branch")
     lengths = [b - a for a, b in zip(q_cu[:-1], q_cu[1:], strict=True)]
     s_lengths = [b - a for a, b in zip(s_cu[:-1], s_cu[1:], strict=True)]
+    q_cu_t = torch.tensor(q_cu, dtype=torch.int32, device=device)
     return BlockPlan(
-        q_cu=q_cu, q_cu_t=torch.tensor(q_cu, dtype=torch.int32, device=device), max_q=max(lengths),
+        q_cu=q_cu, q_cu_t=q_cu_t, max_q=max(lengths),
         g_rows=torch.cat(g_rows).to(device) if branched else None, g_cu=g_cu,
+        g_cu_t=torch.tensor(g_cu, dtype=torch.int32, device=device) if branched else q_cu_t,
         s_rows=torch.cat(s_rows).to(device) if branched else None,
         s_cu_t=torch.tensor(s_cu, dtype=torch.int32, device=device), max_s=max(s_lengths), m_cu=m_cu,
+        m_cu_t=torch.tensor(m_cu, dtype=torch.int32, device=device),
         g_lens=global_attention.lengths(q_cu, g_cu, device), m_lens=global_attention.lengths(m_cu, g_cu, device))
 
 
@@ -172,8 +168,8 @@ class Packed(PackedLayers):
         #: The norm before a layer's attention and MLP, and the MLP; ``serve.fp8.quantize`` swaps in quantizing ones.
         self.norm_input, self.mlp = fused.norm, fused.mlp
         #: The global layers' attention over every virtual sequence at once (``triton_attention.attend``'s signature);
-        #: None: the per-sequence paths.
-        self.global_attend = None
+        #: None: cuDNN or memory-efficient attention per virtual sequence (one varlen call for a ``PaddedPlan``).
+        self.global_attend: Callable[..., torch.Tensor] | None = None
 
     # ---------------------------------------------------------------- attention
 

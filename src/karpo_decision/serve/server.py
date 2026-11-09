@@ -11,6 +11,9 @@ model (passes, readout, answers) times in milliseconds. Each request is logged a
 
 A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
 warmed up with a text request, since Gemma reads text only.
+
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``); a question that does not fit gets
+400.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
@@ -30,7 +34,7 @@ from urllib.parse import urlsplit
 import torch
 import torch.distributed as dist
 
-from ..decider import Decider
+from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded
 from ..protocol import Request, RequestError, images_of
 
@@ -49,12 +53,13 @@ def text_warmup_request() -> Request:
             "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs the plain path on one GPU and
-    reads text only."""
+def load_decider(checkpoint: str, world: int, device: torch.device,
+                 max_length: int = DEFAULT_MAX_LENGTH) -> tuple[Decider, Request]:
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up: a Gemma 4
+    checkpoint runs the plain path on one GPU and reads text only."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
-    return Decider.from_pretrained(checkpoint, device=device), text_warmup_request()
+    return Decider.from_pretrained(checkpoint, device=device, max_length=max_length), text_warmup_request()
 
 
 def scrub(node: Any) -> Any:
@@ -195,13 +200,25 @@ class Handler(BaseHTTPRequestHandler):
             total_ms=round((done - start) * 1000, 1))
 
 
-def main() -> None:
+def positive(text: str) -> int:
+    if not text.isdecimal() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not a positive integer")
+    return int(text)
+
+
+def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
-    args = parser.parse_args()
+    parser.add_argument("--max-length", type=positive, default=DEFAULT_MAX_LENGTH,
+                        help="the longest sequence in tokens")
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = arguments()
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
@@ -211,14 +228,15 @@ def main() -> None:
     # timeout would end them after the first quiet half hour.
     control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device)
+    decider, warmup = load_decider(args.checkpoint, world, device, args.max_length)
     loaded = time.time()
     decider.decide(warmup)
     ranks = Ranks(decider, control, device)
     if rank != 0:
         ranks.follow()
         os._exit(0)
-    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention}
+    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
+            "max_length": decider.max_length}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()

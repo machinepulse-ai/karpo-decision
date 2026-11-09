@@ -43,6 +43,8 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 
+`--max-length` sets the longest sequence in tokens (default 32,768); a question that does not fit gets HTTP 400.
+
 With Docker:
 
 ```bash

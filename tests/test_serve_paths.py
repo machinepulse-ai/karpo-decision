@@ -1,6 +1,7 @@
 """Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain by default, FP8
-projections with ``fp8``, then CUDA graphs unless ``fast`` is false, warmed up with the graphs' warmup request (text
-only). No GPU and no weights: the loader, the quantization and the capture are replaced."""
+projections with ``fp8``, ``triton_attention`` after the quantization, before the graphs, then CUDA graphs unless
+``fast`` is false, warmed up with the graphs' warmup request (text only). No GPU and no weights: the loader, the
+quantization and the capture are replaced."""
 
 import json
 import types
@@ -67,3 +68,28 @@ def test_without_fp8_no_graphs_are_captured(tmp_path, monkeypatch):
                         classmethod(lambda cls, directory, device="cuda", **_: "plain"))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
     assert server.load_decider(path, 1, "cuda:0")[0] == "plain"
+
+
+def test_triton_attention_comes_after_the_quantization_and_before_the_graphs(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    decider = types.SimpleNamespace(model="packed")
+    calls = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda model: calls.append(("fp8", model)))
+    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
+    assert server.load_decider(path, 1, "cuda:0", fp8=True, triton_attention=True)[0] is decider
+    assert calls == [("fp8", "packed"), ("attention", "packed"), ("fast", decider)]
+
+
+def test_triton_attention_without_fp8(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    decider = types.SimpleNamespace(model="packed")
+    calls = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
+    assert server.load_decider(path, 1, "cuda:0", triton_attention=True)[0] is decider
+    assert calls == [("attention", "packed")]

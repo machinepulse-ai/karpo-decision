@@ -2,14 +2,27 @@
 tiny model's: one sequence against float32 math, with logits of order one and in the hundreds; a varlen pack with
 branches (queries and keys with their own boundaries) and an empty sequence against PyTorch's memory-efficient
 attention per virtual sequence; keys beginning past 2^31 elements into the pack (31B only); equal outputs from
-repeated calls; no gradients."""
+repeated calls; no gradients. Through ``Packed.global_attend`` (``triton_attention.enable``), on a tiny random Gemma 4:
+the packed forward stays near the plain path, CUDA graph replays equal the eager padded pass, a causal model is
+refused."""
+
+import sys
+import types
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from karpo_decision.families.gemma import packed as gp
 from karpo_decision.families.gemma import triton_attention as ta
+from karpo_decision.model.packed import pack
+from karpo_decision.serve import graphs
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import test_gemma_blocks as cpu  # noqa: E402
+from test_packed_gemma import build_tiny  # noqa: E402
 
 pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not ta.supported(torch.device("cuda", 0))
                                                   if torch.cuda.is_available() else True, reason="needs an sm_120 GPU")]
@@ -111,3 +124,40 @@ def test_large_logits_match_float32_math(heads, kv_heads, head):
     qf, kf, vf = (t.float().transpose(0, 1) for t in (q, k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)))
     want = (torch.softmax(8.0 * (qf @ kf.transpose(1, 2)), -1) @ vf).transpose(0, 1)
     assert ((got - want).norm() / want.norm()) < 1e-2
+
+
+def tiny(attention="bidirectional"):
+    torch.manual_seed(0)
+    lm = build_tiny().to(GPU, torch.bfloat16)
+    return gp.Packed(types.SimpleNamespace(language_model=lm), attention)
+
+
+def test_packed_forward_with_the_hook_stays_near_the_plain_path():
+    packed = tiny()
+    torch.manual_seed(2)
+    layouts = [[cpu.sequence(13, [])], [cpu.sequence(11, [5, 7])], [cpu.sequence(9, []), cpu.sequence(40, [6])]]
+    with torch.inference_mode():
+        want = [packed(pack(seqs, None, GPU)).float() for seqs in layouts]
+        ta.enable(packed)
+        got = [packed(pack(seqs, None, GPU)).float() for seqs in layouts]
+    for g, w in zip(got, want, strict=True):
+        assert ((g - w).norm() / w.norm()) < 1e-2
+
+
+def test_graph_replays_with_the_hook_equal_the_eager_padded_pass():
+    packed = tiny()
+    ta.enable(packed)
+    eager = graphs.Graphs(packed, max_tokens=128)
+    g = graphs.Graphs(packed, max_tokens=128)
+    g.capture_all()
+    torch.manual_seed(3)
+    with torch.inference_mode():
+        for length in (13, 64, 65, 13):
+            seqs = [cpu.sequence(length, [])]
+            assert torch.equal(g(pack(seqs, None, GPU)), eager(pack(seqs, None, GPU)))
+    assert g.replays == 4
+
+
+def test_enable_refuses_a_causal_model():
+    with pytest.raises(ValueError, match="bidirectional"):
+        ta.enable(tiny("causal"))

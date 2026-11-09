@@ -8,6 +8,7 @@ head. Inference only. Against PyTorch's memory-efficient kernel, the path it rep
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 
@@ -99,3 +100,12 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
                    GROUP=query.shape[1] // key.shape[1], CHUNK=query.shape[2] // 4, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                    num_warps=WARPS, num_stages=1)
     return out
+
+
+def enable(model: Any) -> None:
+    """``attend`` as the global layers' attention of ``model`` (a ``Packed``); ValueError where it does not apply."""
+    if not supported(model.lm.embed_tokens.weight.device):
+        raise ValueError("triton_attention needs an sm_120 GPU")
+    if model.causal_global:
+        raise ValueError("triton_attention reads bidirectional checkpoints only")
+    model.global_attend = attend

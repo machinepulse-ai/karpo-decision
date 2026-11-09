@@ -20,7 +20,8 @@ layers (head size beyond flash attention's 256) run cuDNN's FROST kernels per vi
 (``global_attention``), PyTorch's memory-efficient attention elsewhere. A bidirectional model computes its last layer
 (a global layer) only at the markers, each over its own virtual sequence.
 A pack padded for a CUDA graph (``PaddedPlan``: one single-block sequence and its padding) runs its global layers as one
-varlen memory-efficient call (``global_attention.padded``).
+varlen memory-efficient call (``global_attention.padded``). With ``global_attend`` set (``triton_attention.enable``,
+sm_120), every global layer runs one call over all virtual sequences instead.
 
 The layers are re-expressed with the backbone's own modules and weights (``Gemma4TextDecoderLayer``: sandwich norms,
 q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
@@ -29,6 +30,7 @@ embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are 
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,6 +62,16 @@ class BlockPlan:
     m_cu: list[int]  # marker boundaries over the virtual sequences (markers in pack order)
     g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
     m_lens: torch.Tensor  # the same with the markers as queries
+
+    @functools.cached_property
+    def g_cu_t(self) -> torch.Tensor:
+        """``g_cu`` on the device (``Packed.global_attend``)."""
+        return torch.tensor(self.g_cu, dtype=torch.int32, device=self.q_cu_t.device)
+
+    @functools.cached_property
+    def m_cu_t(self) -> torch.Tensor:
+        """``m_cu`` on the device."""
+        return torch.tensor(self.m_cu, dtype=torch.int32, device=self.q_cu_t.device)
 
 
 @dataclass
@@ -159,6 +171,9 @@ class Packed(PackedLayers):
             raise ValueError("pruning the last layer needs a global last layer")
         #: The norm before a layer's attention and MLP, and the MLP; ``serve.fp8.quantize`` swaps in quantizing ones.
         self.norm_input, self.mlp = fused.norm, fused.mlp
+        #: The global layers' attention over every virtual sequence at once (``triton_attention.attend``'s signature);
+        #: None: the per-sequence paths.
+        self.global_attend = None
 
     # ---------------------------------------------------------------- attention
 
@@ -216,6 +231,14 @@ class Packed(PackedLayers):
             out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
                                            plan.max_s, attn.scaling, self.sliding[0])
             out = out.reshape(x.shape[1], -1)
+        elif self.global_attend is not None:
+            if isinstance(plan, PaddedPlan):
+                out = self.global_attend(query[0], key[0], value[0], plan.cu, plan.cu, plan.size, attn.scaling)
+            else:
+                key, value = self._gather(key, value, plan.g_rows)
+                out = self.global_attend(query[0], key[0], value[0], plan.q_cu_t, plan.g_cu_t, plan.max_q,
+                                         attn.scaling)
+            out = out.reshape(x.shape[1], -1)
         elif isinstance(plan, PaddedPlan):
             out = global_attention.padded(query, key, value, plan.cu, plan.size, self.causal_global, attn.scaling)
             out = out.reshape(x.shape[1], -1)
@@ -243,7 +266,11 @@ class Packed(PackedLayers):
         x = self.norm_input(layer.input_layernorm, h)
         query = self._q(attn, x[:, p.markers], cos[:, p.markers], sin[:, p.markers])
         key, value = self._gather(*self._kv(attn, x, cos, sin), plan.g_rows)
-        out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)
+        if self.global_attend is not None:
+            out = self.global_attend(query[0], key[0], value[0], plan.m_cu_t, plan.g_cu_t, 1,
+                                     attn.scaling).reshape(query.shape[1], -1)
+        else:
+            out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)
         hs = fused.residual_norm(h[:, p.markers], layer.post_attention_layernorm, attn.o_proj(out[None]))
         return fused.add_scale(hs, self._mlp(layer, hs), layer.layer_scalar)
 

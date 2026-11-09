@@ -1,6 +1,8 @@
 """The Triton global attention (``families.gemma.triton_attention``) on an sm_120 GPU, at the 31B's head size and the
-tiny model's: one sequence against float32 math; a varlen pack with branches (queries and keys with their own
-boundaries) and an empty sequence against PyTorch's memory-efficient attention per virtual sequence; no gradients."""
+tiny model's: one sequence against float32 math, with logits of order one and in the hundreds; a varlen pack with
+branches (queries and keys with their own boundaries) and an empty sequence against PyTorch's memory-efficient
+attention per virtual sequence; keys beginning past 2^31 elements into the pack (31B only); equal outputs from
+repeated calls; no gradients."""
 
 import pytest
 import torch
@@ -71,3 +73,41 @@ def test_refuses_gradients():
     q, k, v = tensors(8, 8, 4, 1, 64)
     with pytest.raises(RuntimeError, match="forward"):
         ta.attend(q, k, v, bounds([0, 8]), bounds([0, 8]), 8, 1.0)
+
+
+def test_keys_past_32_bit_offsets_match_the_memory_efficient_path():
+    """The 31B's key rows are 2,048 elements, so row 2^20 starts at element 2^31. A first sequence holds 2^20 keys and
+    no queries, a second 64 queries over the 300 keys after them (only those are filled in)."""
+    torch.manual_seed(2)
+    start, rows, keys = 1 << 20, 64, 300
+    q, k_tail, v_tail = tensors(rows, keys, 32, 4, 512)
+    k, v = (torch.empty(start + keys, 4, 512, device=GPU, dtype=torch.bfloat16) for _ in range(2))
+    k[start:], v[start:] = k_tail, v_tail
+    with torch.inference_mode():
+        got = ta.attend(q, k, v, bounds([0, 0, rows]), bounds([0, start, start + keys]), rows, 1.0).float()
+        want = memory_efficient(q, k[start:], v[start:], [0, rows], [0, keys]).float()
+    assert ((got - want).norm() / want.norm()) < 1e-2
+
+
+@SHAPES
+def test_repeated_calls_are_bitwise_equal(heads, kv_heads, head):
+    torch.manual_seed(3)
+    q, k, v = tensors(500, 700, heads, kv_heads, head)
+    q_cu, k_cu = bounds([0, 200, 500]), bounds([0, 300, 700])
+    with torch.inference_mode():
+        assert torch.equal(ta.attend(q, k, v, q_cu, k_cu, 300, 1.0), ta.attend(q, k, v, q_cu, k_cu, 300, 1.0))
+
+
+@SHAPES
+def test_large_logits_match_float32_math(heads, kv_heads, head):
+    """Queries and keys without the usual 1/8, at scale 8: logits reach the hundreds, past float32's exp unless the
+    kernel subtracts a running maximum."""
+    torch.manual_seed(4)
+    q, k, v = tensors(300, 300, heads, kv_heads, head)
+    q, k = q * 8, k * 8
+    with torch.inference_mode():
+        got = ta.attend(q, k, v, bounds([0, 300]), bounds([0, 300]), 300, 8.0).float()
+    rep = heads // kv_heads
+    qf, kf, vf = (t.float().transpose(0, 1) for t in (q, k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)))
+    want = (torch.softmax(8.0 * (qf @ kf.transpose(1, 2)), -1) @ vf).transpose(0, 1)
+    assert ((got - want).norm() / want.norm()) < 1e-2

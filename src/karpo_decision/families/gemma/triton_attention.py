@@ -28,27 +28,33 @@ if triton is not None:
         block, head, seq = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         q_start, q_end = tl.load(q_cu + seq), tl.load(q_cu + seq + 1)
         k_start, k_end = tl.load(k_cu + seq), tl.load(k_cu + seq + 1)
-        m0 = q_start + block * BLOCK_M
-        k_stop = tl.where(m0 < q_end, k_end, k_start)  # a block past its sequence's queries reads no key
+        n_q, n_k = q_end - q_start, k_end - k_start
+        kv = head // GROUP
+        # a sequence's base pointers are 64-bit (a pack's keys pass 2^31 elements), the offsets inside it 32-bit
+        qb = Q + q_start.to(tl.int64) * s_qt + head * s_qh
+        kb = K + k_start.to(tl.int64) * s_kt + kv * s_kh
+        vb = V + k_start.to(tl.int64) * s_vt + kv * s_vh
+        ob = Out + q_start.to(tl.int64) * s_ot + head * s_oh
+        m0 = block * BLOCK_M
+        k_stop = tl.where(m0 < n_q, n_k, 0)  # a block past its sequence's queries reads no key
         rows = m0 + tl.arange(0, BLOCK_M)
-        live = rows < q_end
+        live = rows < n_q
         d = tl.arange(0, CHUNK)
-        qp = Q + rows[:, None] * s_qt + head * s_qh + d[None, :]
+        qp = qb + rows[:, None] * s_qt + d[None, :]
         q0 = tl.load(qp, mask=live[:, None], other=0.0)
         q1 = tl.load(qp + CHUNK, mask=live[:, None], other=0.0)
         q2 = tl.load(qp + 2 * CHUNK, mask=live[:, None], other=0.0)
         q3 = tl.load(qp + 3 * CHUNK, mask=live[:, None], other=0.0)
-        kv = head // GROUP
         m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         o0 = tl.zeros([BLOCK_M, CHUNK], dtype=tl.float32)
         o1 = tl.zeros([BLOCK_M, CHUNK], dtype=tl.float32)
         o2 = tl.zeros([BLOCK_M, CHUNK], dtype=tl.float32)
         o3 = tl.zeros([BLOCK_M, CHUNK], dtype=tl.float32)
-        for n0 in range(k_start, k_stop, BLOCK_N):
+        for n0 in range(0, k_stop, BLOCK_N):
             cols = n0 + tl.arange(0, BLOCK_N)
-            seen = cols < k_end
-            kp = K + cols[:, None] * s_kt + kv * s_kh + d[None, :]
+            seen = cols < n_k
+            kp = kb + cols[:, None] * s_kt + d[None, :]
             s = tl.dot(q0, tl.trans(tl.load(kp, mask=seen[:, None], other=0.0)))
             s = tl.dot(q1, tl.trans(tl.load(kp + CHUNK, mask=seen[:, None], other=0.0)), s)
             s = tl.dot(q2, tl.trans(tl.load(kp + 2 * CHUNK, mask=seen[:, None], other=0.0)), s)
@@ -59,14 +65,14 @@ if triton is not None:
             p = tl.exp2(s - m_new[:, None])
             l_i = l_i * alpha + tl.sum(p, 1)
             p = p.to(tl.bfloat16)
-            vp = V + cols[:, None] * s_vt + kv * s_vh + d[None, :]
+            vp = vb + cols[:, None] * s_vt + d[None, :]
             o0 = tl.dot(p, tl.load(vp, mask=seen[:, None], other=0.0), o0 * alpha[:, None])
             o1 = tl.dot(p, tl.load(vp + CHUNK, mask=seen[:, None], other=0.0), o1 * alpha[:, None])
             o2 = tl.dot(p, tl.load(vp + 2 * CHUNK, mask=seen[:, None], other=0.0), o2 * alpha[:, None])
             o3 = tl.dot(p, tl.load(vp + 3 * CHUNK, mask=seen[:, None], other=0.0), o3 * alpha[:, None])
             m_i = m_new
         inv = 1.0 / l_i
-        op = Out + rows[:, None] * s_ot + head * s_oh + d[None, :]
+        op = ob + rows[:, None] * s_ot + d[None, :]
         tl.store(op, (o0 * inv[:, None]).to(tl.bfloat16), mask=live[:, None])
         tl.store(op + CHUNK, (o1 * inv[:, None]).to(tl.bfloat16), mask=live[:, None])
         tl.store(op + 2 * CHUNK, (o2 * inv[:, None]).to(tl.bfloat16), mask=live[:, None])
@@ -82,7 +88,8 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
            max_q: int, scale: float) -> torch.Tensor:
     """Bidirectional attention per virtual sequence: (Lq, heads, D) bf16 queries over (Lk, kv heads, D) keys and
     values, sequence i's query rows q_cu[i]:q_cu[i+1] over its key rows k_cu[i]:k_cu[i+1] (int32 on the device),
-    ``max_q`` at least its longest query range; (Lq, heads, D)."""
+    ``max_q`` at least its longest query range; (Lq, heads, D). Row offsets inside a sequence are 32-bit (its rows
+    times the row stride stay below 2^31); a whole pack may exceed that."""
     if torch.is_grad_enabled():
         raise RuntimeError("triton_attention runs the forward only: call it under torch.inference_mode or no_grad")
     out = torch.empty_like(query)

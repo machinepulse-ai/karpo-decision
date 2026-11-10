@@ -46,7 +46,7 @@ It listens on `127.0.0.1` by default and has no authentication or TLS of its own
 at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
 the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
-16k-32k tokens take 1.3-1.4x less time (answers move by bf16 noise).
+16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
 With Docker:
 

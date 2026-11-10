@@ -89,16 +89,20 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
            max_q: int, scale: float) -> torch.Tensor:
     """Bidirectional attention per virtual sequence: (Lq, heads, D) bf16 queries over (Lk, kv heads, D) keys and
     values, sequence i's query rows q_cu[i]:q_cu[i+1] over its key rows k_cu[i]:k_cu[i+1] (int32 on the device),
-    ``max_q`` at least its longest query range; (Lq, heads, D). Row offsets inside a sequence are 32-bit (its rows
-    times the row stride stay below 2^31); a whole pack may exceed that."""
+    ``max_q`` at least its longest query range; (Lq, heads, D). Row offsets inside a sequence are 32-bit: ``max_q``
+    times the query row stride reaching 2^31 (131,072 rows for the 31B) is a ValueError; a whole pack may exceed it."""
     if torch.is_grad_enabled():
         raise RuntimeError("triton_attention runs the forward only: call it under torch.inference_mode or no_grad")
+    if max_q * query.stride(0) >= 1 << 31:
+        raise ValueError(f"triton_attention: the kernel's offsets within a sequence are 32-bit, but max_q {max_q} x "
+                         f"row stride {query.stride(0)} reaches 2^31")
     out = torch.empty_like(query)
     grid = (triton.cdiv(max_q, BLOCK_M), query.shape[1], q_cu.numel() - 1)
-    _forward[grid](query, key, value, out, q_cu, k_cu, scale * math.log2(math.e), query.stride(0), query.stride(1),
-                   key.stride(0), key.stride(1), value.stride(0), value.stride(1), out.stride(0), out.stride(1),
-                   GROUP=query.shape[1] // key.shape[1], CHUNK=query.shape[2] // 4, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                   num_warps=WARPS, num_stages=1)
+    with torch.cuda.device(query.device):  # Triton launches on the current device, not the tensors'
+        _forward[grid](query, key, value, out, q_cu, k_cu, scale * math.log2(math.e), query.stride(0),
+                       query.stride(1), key.stride(0), key.stride(1), value.stride(0), value.stride(1), out.stride(0),
+                       out.stride(1), GROUP=query.shape[1] // key.shape[1], CHUNK=query.shape[2] // 4,
+                       BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=WARPS, num_stages=1)
     return out
 
 

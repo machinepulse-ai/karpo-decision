@@ -12,7 +12,8 @@ model (passes, readout, answers) times in milliseconds. Each request is logged a
 A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
 FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
 (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
-request, since Gemma reads text only; ``--triton-attention`` runs the global layers in one Triton kernel (sm_120 GPUs).
+request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
+(sm_120 GPUs).
 """
 
 from __future__ import annotations
@@ -57,8 +58,8 @@ def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = 
                  fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
     """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on one GPU, its decoder projections
     in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
-    ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers in one Triton
-    kernel (``families.gemma.triton_attention``)."""
+    ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers' attention in
+    one Triton kernel (``families.gemma.triton_attention``)."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     decider = Decider.from_pretrained(checkpoint, device=device)
@@ -218,7 +219,7 @@ def main() -> None:
     parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
     parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
     parser.add_argument("--triton-attention", action="store_true",
-                        help="the global layers in one Triton kernel (sm_120)")
+                        help="the global layers' attention in one Triton kernel (sm_120)")
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)

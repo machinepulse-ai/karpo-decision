@@ -8,9 +8,9 @@ Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or `
 ``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false: the decoder
 projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with ``fp8``,
 single-question requests replay CUDA graphs captured at load, ``serve.graphs``; not with the ``blackwell`` extra's
-kernels); ``triton_attention`` (default false: the global layers in one Triton kernel, sm_120 GPUs and bidirectional
-checkpoints only, ``families.gemma.triton_attention``; answers move by bf16 noise). A request outside the contract, or
-with a question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
+kernels); ``triton_attention`` (default false: the global layers' attention in one Triton kernel, sm_120 GPUs and
+bidirectional checkpoints only, ``families.gemma.triton_attention``; answers move by bf16 noise). A request outside the
+contract, or with a question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
 """
 
 from __future__ import annotations

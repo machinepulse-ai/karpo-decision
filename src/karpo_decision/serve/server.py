@@ -189,7 +189,7 @@ class Handler(BaseHTTPRequestHandler):
         timing = f"encode;dur={encode_ms:.1f}, share;dur={shared:.1f}, model;dur={model_ms:.1f}"
         tokens = response["usage"]["input_tokens"]
         self._send(200, {"id": f"decision-{uuid.uuid4().hex}", "model": self.server.name,
-                         "answers": response["answers"], "usage": {"inputTokens": tokens, "outputTokens": 0}}, timing)
+                         "answers": response["answers"], "usage": {"input_tokens": tokens, "output_tokens": 0}}, timing)
         log(event="request", status=200, questions=len(response["answers"]), tokens=tokens, sequences=len(plan),
             encode_ms=round(encode_ms, 1), share_ms=round(shared, 1), model_ms=round(model_ms, 1),
             total_ms=round((done - start) * 1000, 1))

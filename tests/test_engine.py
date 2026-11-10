@@ -1,7 +1,8 @@
 """The Decision Index engine's path: plain by default, nothing answered at load; FP8 projections with ``fp8=true``, the
 graphs' warmup request answered, then CUDA graphs unless ``fast=false`` or the graphs do not apply; a non-boolean
-``fp8`` or ``fast`` is refused before loading. No GPU and no weights: the loader, the quantization and the capture are
-replaced. ``triton_attention`` enables the Triton global attention after the quantization and before the warmup."""
+``fp8``, ``fast`` or ``triton_attention`` is refused before loading. No GPU and no weights: the loader, the
+quantization and the capture are replaced. ``triton_attention`` enables the Triton global attention after the
+quantization and before the warmup."""
 
 import types
 
@@ -33,11 +34,12 @@ def test_engine_path(monkeypatch, options, applies, path, called, kernels):
     monkeypatch.setattr(engine, "quantize", lambda model: calls.append(("quantize", model)))
     monkeypatch.setattr(engine, "enable_attention", lambda model: calls.append(("attention", model)))
     monkeypatch.setattr(engine.graphs, "fast", lambda d: calls.append(("fast", d)) or applies)
+    monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
     e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", **options)
     received = {"quantize": loaded.model, "attention": loaded.model, "decide": engine.graphs.WARMUP_REQUEST,
                 "fast": loaded}
     assert e.path == path and e.provenance["path"] == path and calls == [(name, received[name]) for name in called]
-    assert e.kernels == kernels and e.provenance["kernels"] == kernels
+    assert e.kernels == kernels and e.provenance["kernels"] == kernels and e.runtime()["kernels"] == kernels
 
 
 def test_engine_refuses_a_non_boolean_fp8(monkeypatch):

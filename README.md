@@ -45,8 +45,8 @@ It listens on `127.0.0.1` by default and has no authentication or TLS of its own
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
 at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
 the graphs.
-`--triton-attention` runs the global layers in one Triton kernel on sm_120 GPUs, about twice as fast on long requests
-(answers move by bf16 noise).
+`--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
+16k-32k tokens take 1.3-1.4x less time (answers move by bf16 noise).
 
 With Docker:
 
@@ -64,7 +64,7 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
 ```
 
 `--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them).
-`--option triton_attention=true` does that in the kit's runner.
+`--option triton_attention=true` is `--triton-attention`.
 
 ## Layout
 

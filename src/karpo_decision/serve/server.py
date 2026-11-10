@@ -4,10 +4,11 @@
 
 Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a
 screenshot as an ``image_url`` part at ``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no
-TLS or keys of its own). Rank 0 encodes each request, so one outside the contract gets 400 and never
-reaches the other ranks; it hands the encoded sequences to them over a CPU (gloo) group, and every rank runs the same
-passes, one request at a time. The ``Server-Timing`` header gives the request's encode, share (the hand-over) and
-model (passes, readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
+TLS or keys of its own). Rank 0 encodes each request, so one outside the contract gets 400, and one with a question
+too long for the model gets 422, without reaching the other ranks; it hands the encoded sequences to them over a CPU
+(gloo) group, and every rank runs the same passes, one request at a time. The ``Server-Timing`` header gives the
+request's encode, share (the hand-over) and model (passes, readout, answers) times in milliseconds. Each request is
+logged as one JSON line without content.
 
 A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
 warmed up with a text request, since Gemma reads text only.
@@ -31,7 +32,7 @@ import torch
 import torch.distributed as dist
 
 from ..decider import Decider
-from ..encoding import Encoded
+from ..encoding import Encoded, LengthError
 from ..protocol import Request, RequestError, images_of
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -173,7 +174,9 @@ class Handler(BaseHTTPRequestHandler):
             encoding = time.perf_counter()
             check_images(request)
             plan = decider.plan(request)
-        except (ValueError, OSError) as error:  # json, the contract, a question too long, an image that does not decode
+        except LengthError as error:  # a question that does not fit: the model declines it
+            return self._error(422, str(error))
+        except (ValueError, OSError) as error:  # json, the contract, an image that does not decode
             return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - answer instead of dropping the connection
             log(event="request", status=500, error=type(error).__name__, stage="encode")

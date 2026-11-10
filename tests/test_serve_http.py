@@ -49,3 +49,15 @@ def test_usage_reports_input_and_output_tokens_in_snake_case(post):
     status, body = post({"state": "page", "questions": {"blank": QUESTION}})
     assert status == 200
     assert body["usage"] == {"input_tokens": 7, "output_tokens": 0}
+
+
+def test_a_question_too_long_answers_422(post):
+    status, body = post({"state": "page", "questions": {"long": QUESTION}})
+    assert status == 422
+    assert "the limit is 8" in body["error"]["message"]
+
+
+def test_a_body_that_is_not_an_object_still_answers_400(post):
+    status, body = post([1])
+    assert status == 400
+    assert "JSON object" in body["error"]["message"]

@@ -48,7 +48,7 @@ the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
-`--max-length` sets the longest sequence in tokens (default 32,768); a question that does not fit gets HTTP 400.
+`--max-length` sets the longest sequence in tokens (default 32,768); a question that does not fit gets HTTP 422.
 
 With Docker:
 

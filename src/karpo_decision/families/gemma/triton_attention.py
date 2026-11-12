@@ -12,6 +12,8 @@ from typing import Any
 
 import torch
 
+from .packed import GLOBAL
+
 try:
     import triton
     import triton.language as tl
@@ -106,10 +108,16 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
     return out
 
 
-def enable(model: Any) -> None:
-    """``attend`` as the global layers' attention of ``model`` (a ``Packed``); ValueError where it does not apply."""
+def enable(model: Any, max_length: int) -> None:
+    """``attend`` as the global layers' attention of ``model`` (a ``Packed``) for sequences of up to ``max_length``
+    tokens; ValueError where it does not apply."""
     if not supported(model.lm.embed_tokens.weight.device):
         raise ValueError("triton_attention needs an sm_120 GPU")
     if model.causal_global:
         raise ValueError("triton_attention reads bidirectional checkpoints only")
+    row = max(layer.self_attn.q_proj.out_features
+              for layer, kind in zip(model.lm.layers, model.types, strict=True) if kind == GLOBAL)
+    if max_length * row >= 1 << 31:
+        raise ValueError(f"triton_attention reads sequences of up to {((1 << 31) - 1) // row} tokens (32-bit offsets "
+                         f"within a sequence), not {max_length}")
     model.global_attend = attend

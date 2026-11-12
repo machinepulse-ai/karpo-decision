@@ -78,10 +78,11 @@ def test_triton_attention_comes_after_the_quantization_and_before_the_graphs(tmp
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda model: calls.append(("fp8", model)))
-    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
     assert server.load_decider(path, 1, "cuda:0", fp8=True, triton_attention=True)[0] is decider
-    assert calls == [("fp8", "packed"), ("attention", "packed"), ("fast", decider)]
+    assert calls == [("fp8", "packed"), ("attention", "packed", DEFAULT_MAX_LENGTH), ("fast", decider)]
 
 
 def test_triton_attention_without_fp8(tmp_path, monkeypatch):
@@ -90,10 +91,11 @@ def test_triton_attention_without_fp8(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
-    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
-    assert server.load_decider(path, 1, "cuda:0", triton_attention=True)[0] is decider
-    assert calls == [("attention", "packed")]
+    assert server.load_decider(path, 1, "cuda:0", 65_536, triton_attention=True)[0] is decider
+    assert calls == [("attention", "packed", 65_536)]
 
 
 def test_gemma_reads_sequences_as_long_as_the_server_is_told(tmp_path, monkeypatch):

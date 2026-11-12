@@ -16,7 +16,8 @@ FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA
 request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
 (sm_120 GPUs).
 
-``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``).
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
+131,072 for the 31B).
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def load_decider(checkpoint: str, world: int, device: torch.device, max_length: 
     if fp8:
         quantize(decider.model)
     if triton_attention:
-        enable_attention(decider.model)
+        enable_attention(decider.model, max_length)
     if fp8 and fast:
         graphs.fast(decider)
     return decider, text_warmup_request()

@@ -8,9 +8,10 @@ Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or `
 ``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false: the decoder
 projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with ``fp8``,
 single-question requests replay CUDA graphs captured at load, ``serve.graphs``; not with the ``blackwell`` extra's
-kernels); ``triton_attention`` (default false: the global layers' attention in one Triton kernel, sm_120 GPUs and
-bidirectional checkpoints only, ``families.gemma.triton_attention``; answers move by bf16 noise). A request outside the
-contract, or with a question that does not fit ``max_length`` tokens with its state, is ``Unsupported``.
+kernels); ``triton_attention`` (default false: the global layers' attention in one Triton kernel, sm_120 GPUs,
+bidirectional checkpoints and a ``max_length`` under 131,072 (31B) only, ``families.gemma.triton_attention``; answers
+move by bf16 noise). A request outside the contract, or with a question that does not fit ``max_length`` tokens with
+its state, is ``Unsupported``.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class DecisionIndexEngine(Engine):
         if fp8:
             quantize(decider.model)
         if triton_attention:
-            enable_attention(decider.model)
+            enable_attention(decider.model, decider.max_length)
         if fp8:
             decider.decide(graphs.WARMUP_REQUEST)  # the fused kernels compile on it with or without graphs
         graphed = fp8 and fast and graphs.fast(decider)

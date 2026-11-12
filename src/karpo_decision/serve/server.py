@@ -19,7 +19,6 @@ request, since Gemma reads text only; ``--triton-attention`` runs the global lay
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import os
 import signal
@@ -31,7 +30,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import torch
-import torch.distributed as dist
 
 from ..decider import Decider
 from ..encoding import Encoded
@@ -41,12 +39,11 @@ from . import graphs
 from .fp8 import quantize
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
-#: What rank 0 sends the other ranks when the server stops.
-STOP = None
+RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
 
 def log(**fields: Any) -> None:
-    print(json.dumps(fields), flush=True)
+    print(json.dumps({"rank": RANK, **fields}), flush=True)
 
 
 def text_warmup_request() -> Request:
@@ -54,14 +51,12 @@ def text_warmup_request() -> Request:
     return graphs.WARMUP_REQUEST
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,
+def load_decider(checkpoint: str, device: torch.device, fp8: bool = False,
                  fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on one GPU, its decoder projections
+    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on its GPU, its decoder projections
     in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
     ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers' attention in
     one Triton kernel (``families.gemma.triton_attention``)."""
-    if world != 1:
-        raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     decider = Decider.from_pretrained(checkpoint, device=device)
     if fp8:
         quantize(decider.model)
@@ -95,45 +90,25 @@ def check_images(request: Request) -> None:
             raise RequestError("an image must be a data:image/... URL")
 
 
-class Ranks:
-    """Runs one request on every rank of the group, rank 0 deciding what runs."""
+class Runner:
+    """Runs one request at a time on this rank's GPU."""
 
-    def __init__(self, decider: Decider, control: dist.ProcessGroup, device: torch.device) -> None:
-        self.decider, self.control, self.device = decider, control, device
+    def __init__(self, decider: Decider, device: torch.device) -> None:
+        self.decider, self.device = decider, device
         self.lock = threading.Lock()
 
-    def run(self, questions: dict[str, Any], plan: list[Encoded]) -> tuple[dict[str, Any], float]:
-        """The response and the milliseconds spent handing the plan to the other ranks."""
+    def run(self, questions: dict[str, Any], plan: list[Encoded]) -> dict[str, Any]:
         with self.lock:
             torch.cuda.set_device(self.device)
-            start = time.perf_counter()
-            dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)
-            shared = (time.perf_counter() - start) * 1000
-            return self.decider.decide({"state": None, "questions": questions}, plans=[plan]), shared
-
-    def follow(self) -> None:
-        while True:
-            box: list[Any] = [None]
-            dist.broadcast_object_list(box, src=0, group=self.control)
-            if box[0] is STOP:
-                return
-            questions, plan = box[0]
-            try:
-                self.decider.decide({"state": None, "questions": questions}, plans=[plan])
-            except Exception as error:  # noqa: BLE001 - rank 0 reports the failure; this rank keeps following
-                log(event="follower_error", error=type(error).__name__)
-
-    def stop(self) -> None:
-        with self.lock:
-            dist.broadcast_object_list([STOP], src=0, group=self.control)
+            return self.decider.decide({"state": None, "questions": questions}, plans=[plan])
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
 
-    def __init__(self, address: tuple[str, int], ranks: Ranks, name: str, info: dict[str, Any]) -> None:
-        self.ranks, self.name, self.info = ranks, name, info
+    def __init__(self, address: tuple[str, int], runner: Runner, name: str, info: dict[str, Any]) -> None:
+        self.runner, self.name, self.info = runner, name, info
         super().__init__(address, Handler)
 
 
@@ -177,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(411, "Content-Length is required", close=True)
         if int(length) > MAX_BODY_BYTES:
             return self._error(413, f"body is larger than {MAX_BODY_BYTES} bytes", close=True)
-        decider = self.server.ranks.decider
+        decider = self.server.runner.decider
         try:
             body = scrub(json.loads(self.rfile.read(int(length))))
             if not isinstance(body, dict):
@@ -195,12 +170,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": {"message": "the request could not be encoded"}})
         running = time.perf_counter()
         try:
-            response, shared = self.server.ranks.run(request["questions"], plan)
+            response = self.server.runner.run(request["questions"], plan)
         except Exception as error:  # noqa: BLE001 - one failed request must not stop the server
             log(event="request", status=500, error=type(error).__name__)
             return self._send(500, {"error": {"message": "inference failed"}})
         done = time.perf_counter()
-        encode_ms, model_ms = (running - encoding) * 1000, (done - running) * 1000 - shared
+        shared = 0.0
+        encode_ms, model_ms = (running - encoding) * 1000, (done - running) * 1000
         timing = f"encode;dur={encode_ms:.1f}, share;dur={shared:.1f}, model;dur={model_ms:.1f}"
         tokens = response["usage"]["input_tokens"]
         self._send(200, {"id": f"decision-{uuid.uuid4().hex}", "model": self.server.name,
@@ -222,27 +198,19 @@ def main() -> None:
                         help="the global layers' attention in one Triton kernel (sm_120)")
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
+    world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
-    dist.init_process_group("nccl", device_id=device)
-    rank, world = dist.get_rank(), dist.get_world_size()
-    # The other ranks wait on this group between requests for as long as the server is idle: the default 30-minute
-    # timeout would end them after the first quiet half hour.
-    control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device, fp8=args.fp8, fast=not args.no_fast,
+    decider, warmup = load_decider(args.checkpoint, device, fp8=args.fp8, fast=not args.no_fast,
                                    triton_attention=args.triton_attention)
     loaded = time.time()
     decider.decide(warmup)
-    ranks = Ranks(decider, control, device)
-    if rank != 0:
-        ranks.follow()
-        os._exit(0)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
             "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
             "kernels": ["triton-attention"] if args.triton_attention else []}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
-    server = Server((args.host, args.port), ranks, args.name, info)
+    server = Server((args.host, args.port), Runner(decider, device), args.name, info)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
@@ -251,8 +219,6 @@ def main() -> None:
     stop.wait()
     server.shutdown()
     server.server_close()
-    ranks.stop()
-    # The process just ends, without tearing the NCCL group down.
     os._exit(0)
 
 

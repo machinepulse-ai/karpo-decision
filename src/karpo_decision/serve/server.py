@@ -15,6 +15,9 @@ FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA
 (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
 request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
 (sm_120 GPUs).
+
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
+131,072 for the 31B).
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,7 +38,7 @@ from urllib.parse import urlsplit
 import torch
 import torch.distributed as dist
 
-from ..decider import Decider
+from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..protocol import Request, RequestError, images_of
@@ -55,19 +59,19 @@ def text_warmup_request() -> Request:
     return graphs.WARMUP_REQUEST
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,
-                 fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on one GPU, its decoder projections
-    in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
-    ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers' attention in
-    one Triton kernel (``families.gemma.triton_attention``)."""
+def load_decider(checkpoint: str, world: int, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
+                 fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up: a Gemma 4
+    checkpoint runs on one GPU, its decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``,
+    single-question requests replay CUDA graphs unless ``fast`` is false or the ``blackwell`` extra's kernels run.
+    ``triton_attention``: the global layers' attention in one Triton kernel (``families.gemma.triton_attention``)."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
-    decider = Decider.from_pretrained(checkpoint, device=device)
+    decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
     if fp8:
         quantize(decider.model)
     if triton_attention:
-        enable_attention(decider.model)
+        enable_attention(decider.model, max_length)
     if fp8 and fast:
         graphs.fast(decider)
     return decider, text_warmup_request()
@@ -213,7 +217,13 @@ class Handler(BaseHTTPRequestHandler):
             total_ms=round((done - start) * 1000, 1))
 
 
-def main() -> None:
+def positive(text: str) -> int:
+    if not text.isdecimal() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not a positive integer")
+    return int(text)
+
+
+def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--host", default="127.0.0.1")
@@ -223,7 +233,13 @@ def main() -> None:
     parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
     parser.add_argument("--triton-attention", action="store_true",
                         help="the global layers' attention in one Triton kernel (sm_120)")
-    args = parser.parse_args()
+    parser.add_argument("--max-length", type=positive, default=DEFAULT_MAX_LENGTH,
+                        help="the longest sequence in tokens")
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = arguments()
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
@@ -233,8 +249,8 @@ def main() -> None:
     # timeout would end them after the first quiet half hour.
     control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device, fp8=args.fp8, fast=not args.no_fast,
-                                   triton_attention=args.triton_attention)
+    decider, warmup = load_decider(args.checkpoint, world, device, args.max_length, fp8=args.fp8,
+                                   fast=not args.no_fast, triton_attention=args.triton_attention)
     loaded = time.time()
     decider.decide(warmup)
     ranks = Ranks(decider, control, device)
@@ -243,7 +259,7 @@ def main() -> None:
         os._exit(0)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
             "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
-            "kernels": ["triton-attention"] if args.triton_attention else []}
+            "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()

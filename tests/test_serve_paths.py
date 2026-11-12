@@ -1,7 +1,7 @@
 """Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain by default, FP8
 projections with ``fp8``, ``triton_attention`` after the quantization, before the graphs, then CUDA graphs unless
-``fast`` is false, warmed up with the graphs' warmup request (text only). No GPU and no weights: the loader, the
-quantization and the capture are replaced."""
+``fast`` is false, warmed up with the graphs' warmup request (text only); and how it reads its ``--max-length``. No
+GPU and no weights: the loader, the quantization and the capture are replaced."""
 
 import json
 import types
@@ -9,6 +9,7 @@ import types
 import pytest
 
 from karpo_decision.config import DecisionConfig
+from karpo_decision.decider import DEFAULT_MAX_LENGTH
 from karpo_decision.protocol import images_of
 from karpo_decision.serve import server
 
@@ -77,10 +78,11 @@ def test_triton_attention_comes_after_the_quantization_and_before_the_graphs(tmp
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda model: calls.append(("fp8", model)))
-    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
     assert server.load_decider(path, 1, "cuda:0", fp8=True, triton_attention=True)[0] is decider
-    assert calls == [("fp8", "packed"), ("attention", "packed"), ("fast", decider)]
+    assert calls == [("fp8", "packed"), ("attention", "packed", DEFAULT_MAX_LENGTH), ("fast", decider)]
 
 
 def test_triton_attention_without_fp8(tmp_path, monkeypatch):
@@ -89,7 +91,32 @@ def test_triton_attention_without_fp8(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
-    monkeypatch.setattr(server, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(server, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
-    assert server.load_decider(path, 1, "cuda:0", triton_attention=True)[0] is decider
-    assert calls == [("attention", "packed")]
+    assert server.load_decider(path, 1, "cuda:0", 65_536, triton_attention=True)[0] is decider
+    assert calls == [("attention", "packed", 65_536)]
+
+
+def test_gemma_reads_sequences_as_long_as_the_server_is_told(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    lengths = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", max_length=None, **_:
+                                    lengths.append(max_length) or "plain"))
+    server.load_decider(path, 1, "cuda:0")
+    server.load_decider(path, 1, "cuda:0", 65_536)
+    assert lengths == [DEFAULT_MAX_LENGTH, 65_536]
+
+
+def test_the_server_takes_its_longest_sequence_from_max_length():
+    assert server.arguments(["--checkpoint", "c"]).max_length == DEFAULT_MAX_LENGTH
+    assert server.arguments(["--checkpoint", "c", "--max-length", "65536"]).max_length == 65_536
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_the_server_refuses_a_max_length_that_is_not_a_positive_integer(value, capsys):
+    with pytest.raises(SystemExit):
+        server.arguments(["--checkpoint", "c", "--max-length", value])
+    err = capsys.readouterr().err
+    assert "argument --max-length" in err and "is not a positive integer" in err

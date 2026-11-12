@@ -12,6 +12,8 @@ from typing import Any
 
 import torch
 
+from .packed import GLOBAL
+
 try:
     import triton
     import triton.language as tl
@@ -20,6 +22,8 @@ except ImportError:  # no Triton (CPU-only installs): not supported
 
 #: Query rows and key rows a program takes per step (the head splits into four chunks), and its warps.
 BLOCK_M, BLOCK_N, WARPS = 64, 64, 8
+#: The kernel's offsets within a sequence are 32-bit: a query range times its row stride stays below this.
+OFFSET_LIMIT = 1 << 31
 
 if triton is not None:
 
@@ -93,7 +97,7 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
     times the query row stride reaching 2^31 (131,072 rows for the 31B) is a ValueError; a whole pack may exceed it."""
     if torch.is_grad_enabled():
         raise RuntimeError("triton_attention runs the forward only: call it under torch.inference_mode or no_grad")
-    if max_q * query.stride(0) >= 1 << 31:
+    if max_q * query.stride(0) >= OFFSET_LIMIT:
         raise ValueError(f"triton_attention: the kernel's offsets within a sequence are 32-bit, but max_q {max_q} x "
                          f"row stride {query.stride(0)} reaches 2^31")
     out = torch.empty_like(query)
@@ -106,10 +110,16 @@ def attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_cu: to
     return out
 
 
-def enable(model: Any) -> None:
-    """``attend`` as the global layers' attention of ``model`` (a ``Packed``); ValueError where it does not apply."""
+def enable(model: Any, max_length: int) -> None:
+    """``attend`` as the global layers' attention of ``model`` (a ``Packed``) for sequences of up to ``max_length``
+    tokens; ValueError where it does not apply."""
     if not supported(model.lm.embed_tokens.weight.device):
         raise ValueError("triton_attention needs an sm_120 GPU")
     if model.causal_global:
         raise ValueError("triton_attention reads bidirectional checkpoints only")
+    row = max(layer.self_attn.q_proj.out_features
+              for layer, kind in zip(model.lm.layers, model.types, strict=True) if kind == GLOBAL)
+    if max_length * row >= OFFSET_LIMIT:
+        raise ValueError(f"triton_attention reads sequences of up to {(OFFSET_LIMIT - 1) // row} tokens (32-bit "
+                         f"offsets within a sequence), not {max_length}")
     model.global_attend = attend

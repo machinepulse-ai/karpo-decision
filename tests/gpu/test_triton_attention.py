@@ -145,7 +145,7 @@ def test_packed_forward_with_the_hook_stays_near_the_plain_path():
     longest = [13, 11, 40, 150, 90]
     with torch.inference_mode():
         want = [packed(pack(seqs, None, GPU)).float() for seqs in layouts]
-        ta.enable(packed)
+        ta.enable(packed, 32_768)
         assert packed.global_attend is ta.attend
         packed.global_attend = spy = mock.Mock(wraps=ta.attend)
         got, max_q = [], []
@@ -168,7 +168,7 @@ def test_graph_replays_with_the_hook_equal_the_eager_padded_pass():
     batches = [[cpu.sequence(length, [])] for length in (13, 64, 65, 150, 13)]
     with torch.inference_mode():
         want = [packed(pack(seqs, None, GPU)).float() for seqs in batches]
-    ta.enable(packed)
+    ta.enable(packed, 32_768)
     packed.global_attend = spy = mock.Mock(wraps=ta.attend)
     eager = graphs.Graphs(packed, max_tokens=256)
     g = graphs.Graphs(packed, max_tokens=256)
@@ -187,4 +187,4 @@ def test_graph_replays_with_the_hook_equal_the_eager_padded_pass():
 
 def test_enable_refuses_a_causal_model():
     with pytest.raises(ValueError, match="bidirectional"):
-        ta.enable(tiny("causal"))
+        ta.enable(tiny("causal"), 32_768)

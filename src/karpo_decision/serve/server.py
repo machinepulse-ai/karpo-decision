@@ -19,6 +19,7 @@ request, since Gemma reads text only; ``--triton-attention`` runs the global lay
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import signal
@@ -39,6 +40,8 @@ from . import graphs
 from .fp8 import quantize
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
+#: How long rank 0 waits for a replica's answer: requests queue on the replica behind its running one.
+FORWARD_TIMEOUT = 600
 RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
 
@@ -101,6 +104,57 @@ class Runner:
         with self.lock:
             torch.cuda.set_device(self.device)
             return self.decider.decide({"state": None, "questions": questions}, plans=[plan])
+
+
+class Replicas:
+    """Rank 0's view of the replicas: slot 0 is this process, slot r the replica on loopback port ``ports[r]``. Each
+    request goes to the slot with the fewest requests in flight, ties in turn."""
+
+    def __init__(self, ports: list[int]) -> None:
+        self.ports = ports
+        self.busy = [0] * len(ports)
+        self.turn = 0
+        self.lock = threading.Lock()
+
+    def pick(self) -> int:
+        with self.lock:
+            count = len(self.busy)
+            slot = min(range(count), key=lambda r: (self.busy[r], (r - self.turn) % count))
+            self.busy[slot] += 1
+            self.turn = (slot + 1) % count
+            return slot
+
+    def done(self, slot: int) -> None:
+        with self.lock:
+            self.busy[slot] -= 1
+
+    def forward(self, slot: int, body: bytes) -> tuple[int, bytes, str | None]:
+        """The replica's status, body and ``Server-Timing`` for the request body, sent as it came."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.ports[slot], timeout=FORWARD_TIMEOUT)
+        try:
+            connection.request("POST", "/v1/systemone", body, {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            return response.status, response.read(), response.getheader("Server-Timing")
+        finally:
+            connection.close()
+
+    def wait(self, timeout: float) -> None:
+        """Returns once every replica answers ``/healthz``: each listens only after its load and warmup."""
+        deadline = time.monotonic() + timeout
+        for slot in range(1, len(self.ports)):
+            while True:
+                connection = http.client.HTTPConnection("127.0.0.1", self.ports[slot], timeout=5)
+                try:
+                    connection.request("GET", "/healthz")
+                    if connection.getresponse().status == 200:
+                        break
+                except OSError:
+                    pass
+                finally:
+                    connection.close()
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"replica {slot} did not come up")
+                time.sleep(0.1)
 
 
 class Server(ThreadingHTTPServer):

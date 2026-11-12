@@ -55,8 +55,8 @@ def test_enable_refuses_a_max_length_past_32_bit_offsets(monkeypatch):
 
 
 def test_enable_reads_the_global_layers_query_rows_of_a_gemma_4_model(monkeypatch):
-    """A tiny Gemma 4 text model: 4 heads of 8 in the sliding layers, of 16 in the global ones, so the limit is
-    (2^31 - 1) // 64 tokens."""
+    """A tiny Gemma 4 text model: 4 heads of 8 in the sliding layers, of 16 in the global ones, so a global query row
+    is 64 elements."""
     pytest.importorskip("transformers.models.gemma4")
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
@@ -69,9 +69,10 @@ def test_enable_reads_the_global_layers_query_rows_of_a_gemma_4_model(monkeypatc
                               layer_types=["sliding_attention", "full_attention"], hidden_size_per_layer_input=0)
     model = Packed(types.SimpleNamespace(language_model=Gemma4TextModel(config)), "bidirectional")
     monkeypatch.setattr(ta, "supported", lambda device: True)
-    with pytest.raises(ValueError, match=f"up to {(2**31 - 1) // 64} tokens"):
-        ta.enable(model, (2**31 - 1) // 64 + 1)
-    ta.enable(model, (2**31 - 1) // 64)
+    longest = (ta.OFFSET_LIMIT - 1) // 64
+    with pytest.raises(ValueError, match=f"up to {longest} tokens"):
+        ta.enable(model, longest + 1)
+    ta.enable(model, longest)
     assert model.global_attend is ta.attend
 
 

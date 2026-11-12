@@ -10,11 +10,12 @@ too long for the model gets 422, without reaching the other ranks; it hands the 
 request's encode, share (the hand-over) and model (passes, readout, answers) times in milliseconds. Each request is
 logged as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
-FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
-(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
-request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
-(sm_120 GPUs).
+A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``; the 31B may run its
+decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
+captured at load (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up
+with a text request, since Gemma reads text only (a Qwen3.5 checkpoint reads a screenshot too and warms up with
+one; the 12B and Qwen3.5 checkpoints serve the plain path); ``--triton-attention`` runs the global layers' attention
+in one Triton kernel (sm_120 GPUs). Paths a backbone does not run are refused at startup (``serve.paths``).
 
 ``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
 131,072 for the 31B).
@@ -23,7 +24,9 @@ request, since Gemma reads text only; ``--triton-attention`` runs the global lay
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
+import io
 import json
 import os
 import signal
@@ -38,14 +41,23 @@ from urllib.parse import urlsplit
 import torch
 import torch.distributed as dist
 
+from ..config import DecisionConfig
 from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
-from ..protocol import Request, RequestError, images_of
+from ..protocol import IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
+from ..templates import BLOCKS, template
 from . import graphs
 from .fp8 import quantize
+from .paths import GRAPHS, require
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
+#: The screenshot warm-up: a blank page as a JPEG data URL in the state, with one question.
+SCREENSHOT_WARMUP_SIZE = (768, 480)
+SCREENSHOT_WARMUP_GREY = (200, 200, 200)
+SCREENSHOT_WARMUP_JPEG_QUALITY = 75
+SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
+SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
 #: What rank 0 sends the other ranks when the server stops.
 STOP = None
 
@@ -54,27 +66,46 @@ def log(**fields: Any) -> None:
     print(json.dumps(fields), flush=True)
 
 
-def text_warmup_request() -> Request:
-    """A tiny request without images, for a family that reads text only (Gemma)."""
-    return graphs.WARMUP_REQUEST
+def screenshot_request() -> Request:
+    """A tiny request with a page-sized screenshot: the first image a process reads sets up the vision tower's kernels
+    (seconds), so the server reads one before it listens."""
+    from PIL import Image
+
+    jpeg = io.BytesIO()
+    Image.new("RGB", SCREENSHOT_WARMUP_SIZE, SCREENSHOT_WARMUP_GREY).save(jpeg, "JPEG",
+                                                                         quality=SCREENSHOT_WARMUP_JPEG_QUALITY)
+    screenshot = {"type": IMAGE_URL,
+                  IMAGE_URL: {"url": IMAGE_DATA_URL + "jpeg;base64," + base64.b64encode(jpeg.getvalue()).decode()}}
+    return {"state": {"page": SCREENSHOT_WARMUP_PAGE, VIEWPORT_SCREENSHOT: screenshot},
+            "questions": SCREENSHOT_WARMUP_QUESTIONS}
+
+
+def warmup_request(checkpoint: str) -> Request:
+    """The request that warms a checkpoint up: text only for a block layout (Gemma reads text only), a screenshot for
+    a joint layout (Qwen)."""
+    if template(DecisionConfig.load(checkpoint).template).kind == BLOCKS:
+        return graphs.WARMUP_REQUEST
+    return screenshot_request()
 
 
 def load_decider(checkpoint: str, world: int, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
                  fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up: a Gemma 4
-    checkpoint runs on one GPU, its decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``,
-    single-question requests replay CUDA graphs unless ``fast`` is false or the ``blackwell`` extra's kernels run.
-    ``triton_attention``: the global layers' attention in one Triton kernel (``families.gemma.triton_attention``)."""
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on one
+    GPU. ``fp8``: the decoder projections in FP8, and single-question requests replaying CUDA graphs unless ``fast``
+    is false, the ``blackwell`` extra's kernels run or the backbone has no graphs. ``triton_attention``: the global
+    layers' attention in one Triton kernel (``families.gemma.triton_attention``). A path the backbone does not run is
+    refused before loading (``serve.paths``)."""
     if world != 1:
-        raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
+        raise ValueError(f"a checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
+    supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
     decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
     if fp8:
         quantize(decider.model)
     if triton_attention:
         enable_attention(decider.model, max_length)
-    if fp8 and fast:
+    if fp8 and fast and GRAPHS in supported:
         graphs.fast(decider)
-    return decider, text_warmup_request()
+    return decider, warmup_request(checkpoint)
 
 
 def scrub(node: Any) -> Any:
@@ -96,7 +127,7 @@ def scrub(node: Any) -> Any:
 def check_images(request: Request) -> None:
     """Images come inline, a data URL each: a path would read the server's own files."""
     for image in images_of(request)[1]:
-        if not (isinstance(image, str) and image.startswith("data:image/")):
+        if not (isinstance(image, str) and image.startswith(IMAGE_DATA_URL)):
             raise RequestError("an image must be a data:image/... URL")
 
 

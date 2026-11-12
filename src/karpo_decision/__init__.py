@@ -1,4 +1,4 @@
-"""Karpo's decision model: typed System One decisions read out of a Gemma 4 backbone."""
+"""Karpo's decision model: typed System One decisions read out of a Gemma 4 or Qwen3.5 backbone."""
 
 from .answers import answer
 from .config import DecisionConfig

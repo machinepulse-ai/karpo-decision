@@ -1,33 +1,36 @@
-"""Requests as token sequences: the block layout a template lays out (``blocks.py``), tokenized with the checkpoint's
-processor, and the positions of the readout markers.
+"""Requests as token sequences: the prompt a template lays out (a joint layout, or a block layout: ``blocks.py``),
+tokenized with the checkpoint's processor, and the positions of the readout markers.
 
-``Encoder.plan`` encodes a request as one sequence, or as several that each repeat the whole shared block when it is
-longer than ``max_length``, so splitting never truncates what a question can read. All parts are encoded before any
-forward pass: a single question that does not fit fails the whole request instead of returning partial answers.
+``Encoder.plan`` encodes a request as one sequence. When it is longer than ``max_length``, a joint layout splits its
+questions in halves until every part fits, and a block layout repeats the whole shared block in each part; every part
+keeps the full state and images, so splitting never truncates what a question can read. All parts are encoded before
+any forward pass: a single question that does not fit fails the whole request instead of returning partial answers.
 """
 
 from __future__ import annotations
 
+import base64
+import io
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from .protocol import Request, validate
-from .templates import BlockTemplate
+from .protocol import IMAGE_DATA_URL, Question, Request, describe, images_of, options, validate
+from .templates import BLOCKS, Template
 
 #: Fullwidth brackets that replace ``<`` and ``>`` of special and added tokens found in request text, so text can never
-#: yield a marker or a chat-template token.
+#: yield a marker, an image placeholder or a chat-template token.
 _ESCAPED = ("\uff1c", "\uff1e")
 
 
 class LengthError(ValueError):
-    """One question, with the state, is longer than ``max_length`` tokens. Nothing is truncated."""
+    """One question, with the state and images, is longer than ``max_length`` tokens. Nothing is truncated."""
 
 
 class TextOnlyError(ValueError):
-    """The request has images; the block layout reads text only."""
+    """The request has images and the layout reads text only (the block layout, which the Gemma family reads)."""
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,12 @@ class Encoded:
     counts: tuple[int, ...]  # option count of each question
     input_ids: torch.Tensor
     markers: torch.Tensor  # readout positions, one per question
+    #: Joint layouts with images: which tokens are image tokens (1) and which text (0).
+    mm_token_type_ids: torch.Tensor | None = None
+    #: Joint layouts with images: the processor's pixel values of every image.
+    pixel_values: torch.Tensor | None = None
+    #: Joint layouts with images: each image's (t, h, w) grid of patches.
+    image_grid_thw: torch.Tensor | None = None
     #: Each token's position in the block layout (``blocks.py``; branches restart after the shared block) and segment
     #: (0 the shared block, k the k-th branch). None: positions 0..n-1, one segment.
     positions: torch.Tensor | None = None
@@ -48,8 +57,21 @@ class Encoded:
         return int(self.input_ids.numel())
 
 
+def open_image(value: Any) -> Any:
+    """A PIL image from a data URL, a file path or an image."""
+    from PIL import Image
+
+    if isinstance(value, Image.Image):
+        return value.convert("RGB")
+    if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
+        with Image.open(io.BytesIO(base64.b64decode(value.split(",", 1)[1], validate=True))) as image:
+            return image.convert("RGB")
+    with Image.open(value) as image:
+        return image.convert("RGB")
+
+
 class Encoder:
-    def __init__(self, processor: Any, codes: Sequence[str], template: BlockTemplate, marker: str) -> None:
+    def __init__(self, processor: Any, codes: Sequence[str], template: Template, marker: str) -> None:
         tokenizer = processor.tokenizer
         ids = tokenizer.encode(marker, add_special_tokens=False)
         if len(ids) != 1 or tokenizer.convert_ids_to_tokens(ids[0]) != marker:
@@ -58,19 +80,62 @@ class Encoder:
         self.codes = tuple(codes)
         self.template = template
         self.marker = marker
+        self.marker_id: int = ids[0]
+        self.pad_id: int = tokenizer.pad_token_id
         # Every added token (``<think>``, ``<tool_call>``, the vision placeholders, ...), not only the named specials.
         self._specials = sorted({*tokenizer.all_special_tokens, *tokenizer.get_added_vocab(), marker}, key=len,
                                 reverse=True)
-        from .blocks import BlockLayout
+        self.blocks = None
+        if template.kind == BLOCKS:
+            from .blocks import BlockLayout
 
-        self.blocks = BlockLayout(self, template)
+            self.blocks = BlockLayout(self, template)
 
     def escape(self, text: str) -> str:
         for token in self._specials:
             text = text.replace(token, token.replace("<", _ESCAPED[0]).replace(">", _ESCAPED[1]))
         return text
 
+    def text(self, state: Any, questions: Sequence[Question], images: int) -> str:
+        messages = self.template.messages(describe(state), questions, self.codes, self.marker, images, self.escape)
+        return self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                  enable_thinking=False)
+
+    def encode(self, request: Request) -> Encoded:
+        """One (validated) request as a single sequence."""
+        state, raw_images = images_of(request)
+        images = [open_image(value) for value in raw_images]
+        questions = list(request["questions"].values())
+        text = self.text(state, questions, len(images))
+        if images:
+            inputs = self.processor(text=[text], images=images, return_tensors="pt")
+        else:  # the processor's own result for text alone, without its image bookkeeping
+            ids = self.processor.tokenizer(text, return_tensors="pt")["input_ids"]
+            inputs = {"input_ids": ids, "mm_token_type_ids": torch.zeros_like(ids)}
+        ids = inputs["input_ids"][0]
+        markers = (ids == self.marker_id).nonzero().flatten()
+        if len(markers) != len(questions):
+            raise ValueError("readout markers do not match the questions after tokenization")
+        mm = inputs.get("mm_token_type_ids")
+        return Encoded(keys=tuple(request["questions"]), counts=tuple(len(options(q)[0]) for q in questions),
+                       input_ids=ids, markers=markers, mm_token_type_ids=None if mm is None else mm[0],
+                       pixel_values=inputs.get("pixel_values"), image_grid_thw=inputs.get("image_grid_thw"))
+
     def plan(self, request: Request, max_length: int | None) -> list[Encoded]:
-        """The request's sequences, every one within ``max_length`` (``blocks.BlockLayout.plan``)."""
+        """The request as one sequence, its questions halved until every part fits ``max_length`` (a block template's
+        layout: ``blocks.BlockLayout.plan``)."""
         validate(request, len(self.codes))
-        return self.blocks.plan(request, max_length)
+        if self.blocks is not None:
+            return self.blocks.plan(request, max_length)
+
+        def split(items: list[tuple[str, Question]]) -> list[Encoded]:
+            encoded = self.encode({**request, "questions": dict(items)})
+            if max_length is None or encoded.length <= max_length:
+                return [encoded]
+            if len(items) == 1:
+                raise LengthError(f"question {items[0][0]!r} needs {encoded.length} tokens with the state and images; "
+                                  f"the limit is {max_length}")
+            middle = len(items) // 2
+            return split(items[:middle]) + split(items[middle:])
+
+        return split(list(request["questions"].items()))

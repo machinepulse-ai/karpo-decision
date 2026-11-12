@@ -1,7 +1,8 @@
 """Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain by default, FP8
 projections with ``fp8``, ``triton_attention`` after the quantization, before the graphs, then CUDA graphs unless
-``fast`` is false, warmed up with the graphs' warmup request (text only); and how it reads its ``--max-length``. No
-GPU and no weights: the loader, the quantization and the capture are replaced."""
+``fast`` is false, warmed up with the graphs' warmup request (text only). A Qwen3.5 checkpoint warms up with a
+screenshot and is refused the opt-in paths. How it reads its ``--max-length``. No GPU and no weights: the loader, the
+quantization and the capture are replaced."""
 
 import json
 import types
@@ -11,11 +12,11 @@ import pytest
 from karpo_decision.config import DecisionConfig
 from karpo_decision.decider import DEFAULT_MAX_LENGTH
 from karpo_decision.protocol import images_of
-from karpo_decision.serve import server
+from karpo_decision.serve import paths, server
 
 
-def checkpoint(directory, model_type):
-    DecisionConfig(template="karpo-blocks-v1", codes=("A",), token_ids=(1,), attention="bidirectional",
+def checkpoint(directory, model_type, template="karpo-blocks-v1"):
+    DecisionConfig(template=template, codes=("A",), token_ids=(1,), attention="bidirectional",
                    base_model="base").save(directory)
     (directory / "config.json").write_text(json.dumps({"model_type": model_type}))
     return str(directory)
@@ -120,3 +121,38 @@ def test_the_server_refuses_a_max_length_that_is_not_a_positive_integer(value, c
         server.arguments(["--checkpoint", "c", "--max-length", value])
     err = capsys.readouterr().err
     assert "argument --max-length" in err and "is not a positive integer" in err
+
+
+def test_a_path_the_backbone_does_not_run_is_refused_before_loading(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "llama")
+    monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="fp8 is not supported for llama checkpoints"):
+        server.load_decider(path, 1, "cuda:0", fp8=True)
+
+
+def test_fp8_without_graphs_for_the_backbone_captures_none(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4_unified")
+    decider = types.SimpleNamespace(model="packed")
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda model: None)
+    monkeypatch.setitem(paths.PATHS, "gemma4_unified", frozenset({"fp8", "triton_attention"}))
+    monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
+    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+
+
+def test_qwen_warms_up_with_a_screenshot(tmp_path, monkeypatch):
+    pytest.importorskip("PIL")
+    path = checkpoint(tmp_path, "qwen3_5", template="karpo-joint-preview-v1")
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: "plain"))
+    decider, warmup = server.load_decider(path, 1, "cuda:0")
+    assert decider == "plain" and len(images_of(warmup)[1]) == 1
+
+
+@pytest.mark.parametrize("option", ["fp8", "triton_attention"])
+def test_qwen_refuses_the_opt_in_paths(tmp_path, monkeypatch, option):
+    path = checkpoint(tmp_path, "qwen3_5", template="karpo-joint-preview-v1")
+    monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match=f"{option} is not supported for qwen3_5 checkpoints"):
+        server.load_decider(path, 1, "cuda:0", **{option: True})

@@ -10,11 +10,11 @@ too long for the model gets 422, without reaching the other ranks; it hands the 
 request's encode, share (the hand-over) and model (passes, readout, answers) times in milliseconds. Each request is
 logged as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
-FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
-(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
-request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
-(sm_120 GPUs).
+A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``; a Gemma 4 checkpoint may run its
+decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
+captured at load (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up
+with a text request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one
+Triton kernel (sm_120 GPUs). Paths a backbone does not run are refused at startup (``serve.paths``).
 
 ``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
 131,072 for the 31B).
@@ -44,6 +44,7 @@ from ..families.gemma.triton_attention import enable as enable_attention
 from ..protocol import Request, RequestError, images_of
 from . import graphs
 from .fp8 import quantize
+from .paths import require
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 #: What rank 0 sends the other ranks when the server stops.
@@ -61,18 +62,20 @@ def text_warmup_request() -> Request:
 
 def load_decider(checkpoint: str, world: int, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
                  fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up: a Gemma 4
-    checkpoint runs on one GPU, its decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``,
-    single-question requests replay CUDA graphs unless ``fast`` is false or the ``blackwell`` extra's kernels run.
-    ``triton_attention``: the global layers' attention in one Triton kernel (``families.gemma.triton_attention``)."""
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on one
+    GPU. ``fp8``: the decoder projections in FP8, and single-question requests replaying CUDA graphs unless ``fast``
+    is false, the ``blackwell`` extra's kernels run or the backbone has no graphs. ``triton_attention``: the global
+    layers' attention in one Triton kernel (``families.gemma.triton_attention``). A path the backbone does not run is
+    refused before loading (``serve.paths``)."""
     if world != 1:
-        raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
+        raise ValueError(f"a checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
+    supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
     decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
     if fp8:
         quantize(decider.model)
     if triton_attention:
         enable_attention(decider.model, max_length)
-    if fp8 and fast:
+    if fp8 and fast and "graphs" in supported:
         graphs.fast(decider)
     return decider, text_warmup_request()
 

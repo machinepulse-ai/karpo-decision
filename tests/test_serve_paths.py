@@ -11,7 +11,7 @@ import pytest
 from karpo_decision.config import DecisionConfig
 from karpo_decision.decider import DEFAULT_MAX_LENGTH
 from karpo_decision.protocol import images_of
-from karpo_decision.serve import server
+from karpo_decision.serve import paths, server
 
 
 def checkpoint(directory, model_type):
@@ -120,3 +120,21 @@ def test_the_server_refuses_a_max_length_that_is_not_a_positive_integer(value, c
         server.arguments(["--checkpoint", "c", "--max-length", value])
     err = capsys.readouterr().err
     assert "argument --max-length" in err and "is not a positive integer" in err
+
+
+def test_a_path_the_backbone_does_not_run_is_refused_before_loading(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "llama")
+    monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="fp8 is not supported for llama checkpoints"):
+        server.load_decider(path, 1, "cuda:0", fp8=True)
+
+
+def test_fp8_without_graphs_for_the_backbone_captures_none(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4_unified")
+    decider = types.SimpleNamespace(model="packed")
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda model: None)
+    monkeypatch.setitem(paths.PATHS, "gemma4_unified", frozenset({"fp8", "triton_attention"}))
+    monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
+    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider

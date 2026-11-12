@@ -33,3 +33,12 @@ def test_readout_cap():
     assert torch.equal(plain, hidden @ rows.t())
     assert torch.allclose(capped, 30.0 * torch.tanh(plain / 30.0))
     assert capped.abs().max() < 30.0
+
+
+def test_gemma4_unified_is_the_gemma_family(tmp_path):
+    gemma = families.of(_model_dir(tmp_path, "gemma4_unified"))
+    assert gemma.MODEL_TYPE == "gemma4" and set(gemma.BACKBONES) == {"gemma4", "gemma4_unified"}
+
+
+def test_model_type_reads_the_backbone_config(tmp_path):
+    assert families.model_type(_model_dir(tmp_path, "gemma4_unified")) == "gemma4_unified"

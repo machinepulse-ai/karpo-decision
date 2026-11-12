@@ -28,6 +28,7 @@ def decider():
       ["triton-attention"])],
     ids=["bf16", "fp8", "fp8-no-fast", "fp8-graphs-not-applicable", "bf16-triton-attention", "fp8-triton-attention"])
 def test_engine_path(monkeypatch, options, applies, path, called, kernels):
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "graphs", "triton_attention"}))
     calls, loaded = [], decider()
     loaded.decide = lambda request: calls.append(("decide", request))
     monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
@@ -62,3 +63,14 @@ def test_engine_refuses_a_non_boolean_triton_attention(monkeypatch):
                         classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="triton_attention"):
         engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", triton_attention="true")
+
+
+def test_engine_refuses_a_path_the_backbone_does_not_run(monkeypatch):
+    def refuse(checkpoint, **_):
+        raise ValueError("fp8 is not supported for qwen3_5 checkpoints")
+
+    monkeypatch.setattr(engine, "require", refuse)
+    monkeypatch.setattr(engine.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="not supported"):
+        engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)

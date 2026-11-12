@@ -4,16 +4,19 @@
 
 Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a
 screenshot as an ``image_url`` part at ``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no
-TLS or keys of its own). Rank 0 encodes each request, so one outside the contract gets 400 and never
-reaches the other ranks; it hands the encoded sequences to them over a CPU (gloo) group, and every rank runs the same
-passes, one request at a time. The ``Server-Timing`` header gives the request's encode, share (the hand-over) and
-model (passes, readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
+TLS or keys of its own). Rank 0 encodes each request, so one outside the contract gets 400, and one with a question
+too long for the model gets 422, without reaching the other ranks; it hands the encoded sequences to them over a CPU
+(gloo) group, and every rank runs the same passes, one request at a time. The ``Server-Timing`` header gives the
+request's encode, share (the hand-over) and model (passes, readout, answers) times in milliseconds. Each request is
+logged as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
-warmed up with a text request, since Gemma reads text only.
+A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
+FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
+(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
+request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
+(sm_120 GPUs).
 
-``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``); a question that does not fit gets
-400.
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``).
 """
 
 from __future__ import annotations
@@ -35,8 +38,11 @@ import torch
 import torch.distributed as dist
 
 from ..decider import DEFAULT_MAX_LENGTH, Decider
-from ..encoding import Encoded
+from ..encoding import Encoded, LengthError
+from ..families.gemma.triton_attention import enable as enable_attention
 from ..protocol import Request, RequestError, images_of
+from . import graphs
+from .fp8 import quantize
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 #: What rank 0 sends the other ranks when the server stops.
@@ -49,17 +55,25 @@ def log(**fields: Any) -> None:
 
 def text_warmup_request() -> Request:
     """A tiny request without images, for a family that reads text only (Gemma)."""
-    return {"state": {"page": {"url": "about:blank"}},
-            "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
+    return graphs.WARMUP_REQUEST
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device,
-                 max_length: int = DEFAULT_MAX_LENGTH) -> tuple[Decider, Request]:
+def load_decider(checkpoint: str, world: int, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
+                 fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
     """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up: a Gemma 4
-    checkpoint runs the plain path on one GPU and reads text only."""
+    checkpoint runs on one GPU, its decoder projections in FP8 when ``fp8`` is true, and reads text only. With ``fp8``,
+    single-question requests replay CUDA graphs unless ``fast`` is false or the ``blackwell`` extra's kernels run.
+    ``triton_attention``: the global layers' attention in one Triton kernel (``families.gemma.triton_attention``)."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
-    return Decider.from_pretrained(checkpoint, device=device, max_length=max_length), text_warmup_request()
+    decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
+    if fp8:
+        quantize(decider.model)
+    if triton_attention:
+        enable_attention(decider.model)
+    if fp8 and fast:
+        graphs.fast(decider)
+    return decider, text_warmup_request()
 
 
 def scrub(node: Any) -> Any:
@@ -178,7 +192,9 @@ class Handler(BaseHTTPRequestHandler):
             encoding = time.perf_counter()
             check_images(request)
             plan = decider.plan(request)
-        except (ValueError, OSError) as error:  # json, the contract, a question too long, an image that does not decode
+        except LengthError as error:  # a question that does not fit: the model declines it
+            return self._error(422, str(error))
+        except (ValueError, OSError) as error:  # json, the contract, an image that does not decode
             return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - answer instead of dropping the connection
             log(event="request", status=500, error=type(error).__name__, stage="encode")
@@ -194,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
         timing = f"encode;dur={encode_ms:.1f}, share;dur={shared:.1f}, model;dur={model_ms:.1f}"
         tokens = response["usage"]["input_tokens"]
         self._send(200, {"id": f"decision-{uuid.uuid4().hex}", "model": self.server.name,
-                         "answers": response["answers"], "usage": {"inputTokens": tokens, "outputTokens": 0}}, timing)
+                         "answers": response["answers"], "usage": {"input_tokens": tokens, "output_tokens": 0}}, timing)
         log(event="request", status=200, questions=len(response["answers"]), tokens=tokens, sequences=len(plan),
             encode_ms=round(encode_ms, 1), share_ms=round(shared, 1), model_ms=round(model_ms, 1),
             total_ms=round((done - start) * 1000, 1))
@@ -212,6 +228,10 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
+    parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
+    parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
+    parser.add_argument("--triton-attention", action="store_true",
+                        help="the global layers' attention in one Triton kernel (sm_120)")
     parser.add_argument("--max-length", type=positive, default=DEFAULT_MAX_LENGTH,
                         help="the longest sequence in tokens")
     return parser.parse_args(argv)
@@ -228,7 +248,8 @@ def main() -> None:
     # timeout would end them after the first quiet half hour.
     control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device, args.max_length)
+    decider, warmup = load_decider(args.checkpoint, world, device, args.max_length, fp8=args.fp8,
+                                   fast=not args.no_fast, triton_attention=args.triton_attention)
     loaded = time.time()
     decider.decide(warmup)
     ranks = Ranks(decider, control, device)
@@ -236,7 +257,8 @@ def main() -> None:
         ranks.follow()
         os._exit(0)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
-            "max_length": decider.max_length}
+            "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
+            "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()

@@ -19,6 +19,9 @@ layers run one varlen flash-attention call with separate query and key boundarie
 layers (head size beyond flash attention's 256) run cuDNN's FROST kernels per virtual sequence on Blackwell
 (``global_attention``), PyTorch's memory-efficient attention elsewhere. A bidirectional model computes its last layer
 (a global layer) only at the markers, each over its own virtual sequence.
+A pack padded for a CUDA graph (``PaddedPlan``: one single-block sequence and its padding) runs its global layers as one
+varlen memory-efficient call (``global_attention.padded``). With ``global_attend`` set (``triton_attention.enable``,
+sm_120), every global layer runs one call over all virtual sequences instead.
 
 The layers are re-expressed with the backbone's own modules and weights (``Gemma4TextDecoderLayer``: sandwich norms,
 q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
@@ -27,6 +30,7 @@ embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,17 +56,47 @@ class BlockPlan:
     max_q: int
     g_rows: torch.Tensor | None  # None: every virtual sequence's keys are its own rows (no branches)
     g_cu: list[int]
+    g_cu_t: torch.Tensor  # g_cu on the device (``Packed.global_attend``); q_cu_t itself without branches
     s_rows: torch.Tensor | None
     s_cu_t: torch.Tensor
     max_s: int
     m_cu: list[int]  # marker boundaries over the virtual sequences (markers in pack order)
+    m_cu_t: torch.Tensor  # m_cu on the device
     g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
     m_lens: torch.Tensor  # the same with the markers as queries
 
 
+@dataclass
+class PaddedPlan:
+    """One single-block sequence of L rows padded to ``size`` rows (``serve.graphs``): the real rows and the padding are
+    two sequences for attention, ``cu`` = [0, L, size] on the device."""
+
+    cu: torch.Tensor
+    size: int
+    g_rows: None = None
+    s_rows: None = None
+
+    @property
+    def q_cu_t(self) -> torch.Tensor:
+        return self.cu
+
+    @property
+    def s_cu_t(self) -> torch.Tensor:
+        return self.cu
+
+    @property
+    def max_q(self) -> int:
+        return self.size
+
+    @property
+    def max_s(self) -> int:
+        return self.size
+
+
 def block_plan(p: Pack, window: int) -> BlockPlan:
     """The virtual sequences of ``p``'s block layouts (``window``: the sliding layers' window, a token and the
-    window - 1 before it)."""
+    window - 1 before it). Its device tensors are all built here, before any layer is queued: a host-to-device copy
+    made mid-forward waits for the GPU work ahead of it."""
     bounds = p.cu_cpu.tolist()
     segments = p.segment_ids_cpu
     q_cu, g_cu, s_cu = [0], [0], [0]
@@ -99,11 +133,14 @@ def block_plan(p: Pack, window: int) -> BlockPlan:
             raise ValueError("a block's readout marker must be its last token, one per branch")
     lengths = [b - a for a, b in zip(q_cu[:-1], q_cu[1:], strict=True)]
     s_lengths = [b - a for a, b in zip(s_cu[:-1], s_cu[1:], strict=True)]
+    q_cu_t = torch.tensor(q_cu, dtype=torch.int32, device=device)
     return BlockPlan(
-        q_cu=q_cu, q_cu_t=torch.tensor(q_cu, dtype=torch.int32, device=device), max_q=max(lengths),
+        q_cu=q_cu, q_cu_t=q_cu_t, max_q=max(lengths),
         g_rows=torch.cat(g_rows).to(device) if branched else None, g_cu=g_cu,
+        g_cu_t=torch.tensor(g_cu, dtype=torch.int32, device=device) if branched else q_cu_t,
         s_rows=torch.cat(s_rows).to(device) if branched else None,
         s_cu_t=torch.tensor(s_cu, dtype=torch.int32, device=device), max_s=max(s_lengths), m_cu=m_cu,
+        m_cu_t=torch.tensor(m_cu, dtype=torch.int32, device=device),
         g_lens=global_attention.lengths(q_cu, g_cu, device), m_lens=global_attention.lengths(m_cu, g_cu, device))
 
 
@@ -128,6 +165,11 @@ class Packed(PackedLayers):
         self.prune_last = attention == "bidirectional"
         if self.prune_last and self.types[-1] != GLOBAL:
             raise ValueError("pruning the last layer needs a global last layer")
+        #: The norm before a layer's attention and MLP, and the MLP; ``serve.fp8.quantize`` swaps in quantizing ones.
+        self.norm_input, self.mlp = fused.norm, fused.mlp
+        #: The global layers' attention over every virtual sequence at once (``triton_attention.attend``'s signature);
+        #: None: cuDNN or memory-efficient attention per virtual sequence (one varlen call for a ``PaddedPlan``).
+        self.global_attend: Callable[..., torch.Tensor] | None = None
 
     # ---------------------------------------------------------------- attention
 
@@ -185,6 +227,17 @@ class Packed(PackedLayers):
             out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
                                            plan.max_s, attn.scaling, self.sliding[0])
             out = out.reshape(x.shape[1], -1)
+        elif self.global_attend is not None:
+            if isinstance(plan, PaddedPlan):
+                out = self.global_attend(query[0], key[0], value[0], plan.cu, plan.cu, plan.size, attn.scaling)
+            else:
+                key, value = self._gather(key, value, plan.g_rows)
+                out = self.global_attend(query[0], key[0], value[0], plan.q_cu_t, plan.g_cu_t, plan.max_q,
+                                         attn.scaling)
+            out = out.reshape(x.shape[1], -1)
+        elif isinstance(plan, PaddedPlan):
+            out = global_attention.padded(query, key, value, plan.cu, plan.size, self.causal_global, attn.scaling)
+            out = out.reshape(x.shape[1], -1)
         else:
             key, value = self._gather(key, value, plan.g_rows)
             out = self._global(query, key, value, plan.q_cu, plan.g_cu, plan.g_lens, self.causal_global, attn.scaling)
@@ -192,13 +245,12 @@ class Packed(PackedLayers):
 
     # ---------------------------------------------------------------- layers
 
-    @staticmethod
-    def _mlp(layer: Any, h: torch.Tensor) -> torch.Tensor:
-        x = fused.norm(layer.pre_feedforward_layernorm, h)
-        return fused.norm(layer.post_feedforward_layernorm, fused.mlp(layer.mlp, x))
+    def _mlp(self, layer: Any, h: torch.Tensor) -> torch.Tensor:
+        x = self.norm_input(layer.pre_feedforward_layernorm, h)
+        return fused.norm(layer.post_feedforward_layernorm, self.mlp(layer.mlp, x))
 
     def layer(self, layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, p: Pack) -> torch.Tensor:
-        attn = self.attention(layer.self_attn, fused.norm(layer.input_layernorm, h), cos, sin, p)
+        attn = self.attention(layer.self_attn, self.norm_input(layer.input_layernorm, h), cos, sin, p)
         h = fused.residual_norm(h, layer.post_attention_layernorm, attn)
         return fused.add_scale(h, self.mlp_branch(self._mlp, layer, h), layer.layer_scalar)
 
@@ -207,25 +259,44 @@ class Packed(PackedLayers):
         """The last (global) layer for the marker rows only: each over the keys of its own virtual sequence."""
         plan = p.plan
         attn = layer.self_attn
-        x = fused.norm(layer.input_layernorm, h)
+        x = self.norm_input(layer.input_layernorm, h)
         query = self._q(attn, x[:, p.markers], cos[:, p.markers], sin[:, p.markers])
         key, value = self._gather(*self._kv(attn, x, cos, sin), plan.g_rows)
-        out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)
+        if self.global_attend is not None:
+            out = self.global_attend(query[0], key[0], value[0], plan.m_cu_t, plan.g_cu_t, 1,
+                                     attn.scaling).reshape(query.shape[1], -1)
+        else:
+            out = self._global(query, key, value, plan.m_cu, plan.g_cu, plan.m_lens, False, attn.scaling)
         hs = fused.residual_norm(h[:, p.markers], layer.post_attention_layernorm, attn.o_proj(out[None]))
         return fused.add_scale(hs, self._mlp(layer, hs), layer.layer_scalar)
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """(1, T, hidden) scaled token embeddings."""
+        return self.lm.embed_tokens(input_ids)[None]
+
+    def rope(self, h: torch.Tensor, seqpos: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Per layer type, the rotary tables (cos, sin) at ``seqpos``."""
+        return {t: self.lm.rotary_emb(h, seqpos[None], t) for t in set(self.types)}
+
+    def body(self, h: torch.Tensor, rope: dict[str, tuple[torch.Tensor, torch.Tensor]], p: Pack) -> torch.Tensor:
+        """The layers that run on every token (all but the last in a bidirectional model)."""
+        for index in range(len(self.layers) - 1 if self.prune_last else len(self.layers)):
+            h = self.run(index, h, *rope[self.types[index]], p)
+        return h
+
+    def head(self, h: torch.Tensor, rope: dict[str, tuple[torch.Tensor, torch.Tensor]], p: Pack) -> torch.Tensor:
+        """(M, hidden) final-normalized hidden states at the markers, in pack order."""
+        if self.prune_last:
+            h = self.layers[-1].packed_forward(h, *rope[self.types[-1]], p, markers_only=True)
+        else:
+            h = h[:, p.markers]
+        return self.lm.norm(h)[0]
 
     def forward(self, p: Pack) -> torch.Tensor:
         """(M, hidden) final-normalized hidden states at the markers, in pack order."""
         if p.cu_cpu is None or p.segment_ids_cpu is None:
             raise ValueError("the Gemma family reads text-only block layouts (karpo-blocks-v1)")
         p.plan = block_plan(p, self.window)
-        h = self.lm.embed_tokens(p.input_ids)[None]
-        rope = {t: self.lm.rotary_emb(h, p.seqpos[None], t) for t in set(self.types)}
-        last = len(self.layers) - 1 if self.prune_last else len(self.layers)
-        for index in range(last):
-            h = self.run(index, h, *rope[self.types[index]], p)
-        if self.prune_last:
-            h = self.layers[-1].packed_forward(h, *rope[self.types[-1]], p, markers_only=True)
-        else:
-            h = h[:, p.markers]
-        return self.lm.norm(h)[0]
+        h = self.embed(p.input_ids)
+        rope = self.rope(h, p.seqpos)
+        return self.head(self.body(h, rope, p), rope, p)

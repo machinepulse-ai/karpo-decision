@@ -1,7 +1,10 @@
 """Rank 0's replicas: the least busy slot serves, ties rotate, a forwarded request comes back as the replica
 answered it. No GPU: the replicas are plain HTTP servers."""
 
+import http.client
+import json
 import threading
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -79,3 +82,86 @@ def test_wait_returns_once_every_replica_answers(replica):
 def test_wait_times_out_on_a_replica_that_never_listens():
     with pytest.raises(TimeoutError, match="replica 1"):
         server.Replicas([0, closed_port()]).wait(timeout=0.3)
+
+
+class FakeRunner:
+    """Stands in for the GPU: plans a request as one sequence and answers it."""
+
+    def __init__(self):
+        self.decider = types.SimpleNamespace(plan=lambda request: ["sequence"])
+        self.ran = 0
+
+    def run(self, questions, plan):
+        self.ran += 1
+        return {"answers": {name: "local" for name in questions}, "usage": {"input_tokens": 3}}
+
+
+@pytest.fixture
+def rank0(replica):
+    """Rank 0 with one replica behind it: (post, runner, replicas, replica)."""
+    runner, replicas = FakeRunner(), server.Replicas([0, replica.server_address[1]])
+    httpd = server.Server(("127.0.0.1", 0), runner, "model", {"ranks": 2}, replicas)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def post(body):
+        connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+        connection.request("POST", "/v1/systemone", body)
+        response = connection.getresponse()
+        result = response.status, json.loads(response.read()), response.getheader("Server-Timing")
+        connection.close()
+        return result
+
+    yield post, runner, replicas, replica
+    httpd.shutdown()
+    httpd.server_close()
+
+
+BODY = json.dumps({"state": "s", "questions": {"q": {"type": "choice", "options": ["a", "b"]}}}).encode()
+
+
+def test_rank_0_serves_the_first_request_itself_and_forwards_the_next(rank0):
+    post, runner, replicas, replica = rank0
+    status, body, timing = post(BODY)
+    assert status == 200 and body["answers"] == {"q": "local"} and runner.ran == 1 and replica.bodies == []
+    status, body, timing = post(BODY)
+    assert status == 200 and body == {"answers": {}} and runner.ran == 1 and replica.bodies == [BODY]
+    names = [part.split(";")[0] for part in timing.split(", ")]
+    assert names == ["encode", "share", "model"] and "encode;dur=1.0" in timing and "model;dur=2.0" in timing
+    assert replicas.busy == [0, 0]
+
+
+def test_a_replica_error_comes_back_as_it_is(rank0):
+    post, runner, replicas, replica = rank0
+    replica.status, replica.body = 400, b'{"error": {"message": "no questions"}}'
+    post(BODY)
+    assert post(BODY)[:2] == (400, {"error": {"message": "no questions"}})
+    assert replicas.busy == [0, 0]
+
+
+def test_a_replica_that_is_gone_answers_500(rank0):
+    post, runner, replicas, replica = rank0
+    replicas.ports[1] = closed_port()
+    post(BODY)
+    assert post(BODY)[:2] == (500, {"error": {"message": "inference failed"}})
+    assert replicas.busy == [0, 0]
+
+
+def test_without_replicas_every_request_is_served_here():
+    runner = FakeRunner()
+    httpd = server.Server(("127.0.0.1", 0), runner, "model", {"ranks": 1})
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        for _ in range(3):
+            connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+            connection.request("POST", "/v1/systemone", BODY)
+            assert connection.getresponse().status == 200
+            connection.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert runner.ran == 3
+
+
+def test_replicas_listen_on_loopback_ports_after_the_public_one():
+    assert server.listen_address("0.0.0.0", 18440, 0) == ("0.0.0.0", 18440)
+    assert server.listen_address("0.0.0.0", 18440, 3) == ("127.0.0.1", 18443)

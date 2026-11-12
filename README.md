@@ -42,6 +42,8 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 ```
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
+`--nproc_per_node N` loads one replica per GPU: rank 0 hands each request to the replica with the fewest in
+flight, and replica r listens on loopback port `port + r`.
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
 at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
 the graphs.

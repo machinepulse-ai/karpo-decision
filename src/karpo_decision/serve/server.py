@@ -1,15 +1,16 @@
-"""System One over HTTP for a decision checkpoint, under torchrun on one GPU.
+"""System One over HTTP for a decision checkpoint, under torchrun, one replica per GPU.
 
     torchrun --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint path/to/checkpoint --port 18440
 
-Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a
-screenshot as an ``image_url`` part at ``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no
-TLS or keys of its own). Rank 0 encodes each request, so one outside the contract gets 400 and never
-reaches the other ranks; it hands the encoded sequences to them over a CPU (gloo) group, and every rank runs the same
-passes, one request at a time. The ``Server-Timing`` header gives the request's encode, share (the hand-over) and
-model (passes, readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
+Every rank loads the checkpoint on its own GPU and serves one request at a time. Rank 0 serves ``POST /v1/systemone``
+(``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a screenshot as an ``image_url`` part at
+``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no TLS or keys of its own), once every
+replica is up. With ``--nproc_per_node N`` it hands each request to the rank with the fewest in flight, itself
+included; rank r listens on loopback port ``port + r``. The ``Server-Timing`` header gives the request's encode,
+share (the hop through rank 0) and model (passes, readout, answers) times in milliseconds. Each request is logged
+by the rank that ran it, as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
+A Gemma 4 checkpoint serves through the ``Decider``, its decoder projections in
 FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
 (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
 request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
@@ -22,6 +23,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -42,6 +44,7 @@ from .fp8 import quantize
 MAX_BODY_BYTES = 4 * 1024 * 1024
 #: How long rank 0 waits for a replica's answer: requests queue on the replica behind its running one.
 FORWARD_TIMEOUT = 600
+TIMING = re.compile(r"(encode|model);dur=([0-9.]+)")
 RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
 
@@ -157,12 +160,18 @@ class Replicas:
                 time.sleep(0.1)
 
 
+def listen_address(host: str, port: int, rank: int) -> tuple[str, int]:
+    """Rank 0 listens where the server was asked to; replica r on loopback, r ports after it."""
+    return (host, port) if rank == 0 else ("127.0.0.1", port + rank)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
 
-    def __init__(self, address: tuple[str, int], runner: Runner, name: str, info: dict[str, Any]) -> None:
-        self.runner, self.name, self.info = runner, name, info
+    def __init__(self, address: tuple[str, int], runner: Runner, name: str, info: dict[str, Any],
+                 replicas: Replicas | None = None) -> None:
+        self.runner, self.name, self.info, self.replicas = runner, name, info, replicas
         super().__init__(address, Handler)
 
 
@@ -176,7 +185,9 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, status: int, body: dict[str, Any], timing: str | None = None) -> None:
-        data = json.dumps(body, allow_nan=False).encode()
+        self._send_bytes(status, json.dumps(body, allow_nan=False).encode(), timing)
+
+    def _send_bytes(self, status: int, data: bytes, timing: str | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -206,9 +217,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(411, "Content-Length is required", close=True)
         if int(length) > MAX_BODY_BYTES:
             return self._error(413, f"body is larger than {MAX_BODY_BYTES} bytes", close=True)
+        raw = self.rfile.read(int(length))
+        replicas = self.server.replicas
+        slot = replicas.pick() if replicas else 0
+        try:
+            if slot:
+                self._forward(slot, raw, start)
+            else:
+                self._serve(raw, start)
+        finally:
+            if replicas:
+                replicas.done(slot)
+
+    def _forward(self, slot: int, raw: bytes, start: float) -> None:
+        """The replica's answer as it is; ``share`` is what the hop through this rank added."""
+        try:
+            status, data, timing = self.server.replicas.forward(slot, raw)
+        except Exception as error:  # noqa: BLE001 - one failed request must not stop the server
+            log(event="request", status=500, error=type(error).__name__, stage="forward", replica=slot)
+            return self._send(500, {"error": {"message": "inference failed"}})
+        spent = dict(TIMING.findall(timing or ""))
+        if len(spent) == 2:
+            encode_ms, model_ms = float(spent["encode"]), float(spent["model"])
+            shared = max((time.perf_counter() - start) * 1000 - encode_ms - model_ms, 0.0)
+            timing = f"encode;dur={encode_ms:.1f}, share;dur={shared:.1f}, model;dur={model_ms:.1f}"
+        self._send_bytes(status, data, timing)
+
+    def _serve(self, raw: bytes, start: float) -> None:
         decider = self.server.runner.decider
         try:
-            body = scrub(json.loads(self.rfile.read(int(length))))
+            body = scrub(json.loads(raw))
             if not isinstance(body, dict):
                 raise RequestError("the body must be a JSON object")
             request: Request = {"state": body.get("state", ""), "questions": body.get("questions")}
@@ -264,12 +302,17 @@ def main() -> None:
             "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
             "kernels": ["triton-attention"] if args.triton_attention else []}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
-    server = Server((args.host, args.port), Runner(decider, device), args.name, info)
+    replicas = None
+    if local == 0 and world > 1:
+        replicas = Replicas([args.port + rank for rank in range(world)])
+        replicas.wait(timeout=3600)
+    address = listen_address(args.host, args.port, local)
+    server = Server(address, Runner(decider, device), args.name, info, replicas)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log(event="listening", host=args.host, port=args.port, model=args.name)
+    log(event="listening", host=address[0], port=address[1], model=args.name)
     stop.wait()
     server.shutdown()
     server.server_close()

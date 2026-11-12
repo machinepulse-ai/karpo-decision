@@ -5,18 +5,20 @@ build-backend = "hatchling.build"
 [project]
 name = "karpo-decision"
 version = "0.1.0"
-description = "Karpo's decision model, inference: typed System One decisions read out of a Gemma 4 backbone"
+description = "Karpo's decision model, inference: typed System One decisions read out of a Gemma 4 or Qwen3.5 backbone"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.14",          # torch.nn.attention.varlen with window_size and enable_gqa
-    "transformers>=5.17",   # Gemma 4 (gemma4) backbones
+    "transformers>=5.17",   # Gemma 4 (gemma4, gemma4_unified) and Qwen3.5 (qwen3_5) backbones
     "safetensors>=0.6",
 ]
 
 [project.optional-dependencies]
+# Qwen3.5 checkpoints: the linear-attention kernels and the image processor.
+qwen = ["flash-linear-attention>=0.5.2", "torchvision>=0.29", "pillow>=11"]
 # Gemma's attention kernels on Blackwell: cuDNN's FROST engines (global layers, head size 512) and flash-attention 4
 # (sliding layers, head size 256, its generic d256 backward); without them the memory-efficient / FA2 paths serve.
 blackwell = ["nvidia-cudnn-frontend==1.32.1", "nvidia-cutlass-dsl==4.8.1", "apache-tvm-ffi==0.1.15.post2",

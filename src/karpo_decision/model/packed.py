@@ -22,6 +22,9 @@ from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selectiv
 
 from ..encoding import Encoded
 
+#: The M-RoPE axes: time, height, width.
+MROPE_AXES = 3
+
 
 @dataclass
 class Pack:
@@ -40,6 +43,12 @@ class Pack:
     #: the device and on CPU (the family plans its attention with it); ``seqpos`` then holds the layout's positions.
     segment_ids: torch.Tensor | None = None
     segment_ids_cpu: torch.Tensor | None = None
+    #: Joint layouts only: (3, 1, T) M-RoPE positions, and the images' pixels and grids.
+    rope: torch.Tensor | None = None
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    #: Qwen: right-padded segments laid end to end when ``cu_cpu`` is None (one batch row each in the delta rule).
+    segments: int = 1
     #: A family's plan of the pack's attention, computed once by its forward pass and reused by every layer (and by
     #: recomputation in backward).
     plan: Any = None
@@ -47,6 +56,15 @@ class Pack:
     @property
     def tokens(self) -> int:
         return int(self.input_ids.numel())
+
+
+def positions(backbone: Any, sequence: Encoded) -> torch.Tensor:
+    """(3, T) M-RoPE positions of one joint sequence: plain 0..T-1 on every axis unless it has images."""
+    if sequence.image_grid_thw is None:
+        return torch.arange(sequence.length).expand(MROPE_AXES, -1)
+    rope, _ = backbone.get_rope_index(sequence.input_ids[None], sequence.mm_token_type_ids[None],
+                                      image_grid_thw=sequence.image_grid_thw)
+    return rope[:, 0]
 
 
 def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> Pack:
@@ -60,6 +78,9 @@ def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> P
     cu_cpu = F.pad(torch.tensor(lengths).cumsum(0), (1, 0))
     starts = cu_cpu[:-1].tolist()
     marker_counts = [len(s.keys) for s in sequences]
+    pixels = [s.pixel_values for s in sequences if s.pixel_values is not None]
+    grids = [s.image_grid_thw for s in sequences if s.image_grid_thw is not None]
+    rope = None if all(blocks) else torch.cat([positions(backbone, s) for s in sequences], dim=1)[:, None, :]
     return Pack(
         input_ids=torch.cat([s.input_ids for s in sequences]).to(device, non_blocking=True),
         seqpos=seqpos.to(device, non_blocking=True),
@@ -71,6 +92,9 @@ def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> P
         max_markers=max(marker_counts),
         segment_ids=None if segment_ids is None else segment_ids.to(device, non_blocking=True),
         segment_ids_cpu=segment_ids,
+        rope=None if rope is None else rope.to(device, non_blocking=True),
+        pixel_values=torch.cat(pixels).to(device) if pixels else None,
+        image_grid_thw=torch.cat(grids).to(device) if grids else None,
     )
 
 

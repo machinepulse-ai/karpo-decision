@@ -9,9 +9,13 @@ from pathlib import Path
 from ..config import DecisionConfig
 from ..families import model_type
 
+#: The names of the opt-in paths.
+FP8, GRAPHS, TRITON_ATTENTION = "fp8", "graphs", "triton_attention"
+
 PATHS: dict[str, frozenset[str]] = {
-    "gemma4": frozenset({"fp8", "graphs", "triton_attention"}),
-    "gemma4_unified": frozenset({"fp8", "graphs", "triton_attention"}),
+    "gemma4": frozenset({FP8, GRAPHS, TRITON_ATTENTION}),
+    "gemma4_unified": frozenset(),
+    "qwen3_5": frozenset(),
 }
 
 
@@ -21,7 +25,7 @@ def require(checkpoint: str | Path, fp8: bool = False, triton_attention: bool = 
     backbone = DecisionConfig.load(checkpoint).backbone
     name = model_type(backbone or checkpoint)
     supported = PATHS.get(name, frozenset())
-    for option, asked in (("fp8", fp8), ("triton_attention", triton_attention)):
+    for option, asked in ((FP8, fp8), (TRITON_ATTENTION, triton_attention)):
         if asked and option not in supported:
             raise ValueError(f"{option} is not supported for {name} checkpoints")
     return supported

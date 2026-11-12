@@ -21,6 +21,10 @@ from typing import Any, Literal, NotRequired, TypedDict
 MAX_OPTIONS = 255
 #: Where a request may carry the page screenshot (a data URL) inside the state.
 VIEWPORT_SCREENSHOT = "viewport_screenshot"
+#: The type of an OpenAI-style image part.
+IMAGE_URL = "image_url"
+#: How an inline image's URL starts.
+IMAGE_DATA_URL = "data:image/"
 #: What a noul question's two options say when its criteria do not describe them.
 NOUL_KEYS = ("false", "true")
 NOUL_DEFAULTS = ("No / false", "Yes / true")
@@ -93,8 +97,8 @@ def validate(request: Request, max_options: int = MAX_OPTIONS) -> None:
 
 def image_source(value: Any) -> Any:
     """An image as ``encoding.open_image`` reads it: the URL of an ``image_url`` part, anything else unchanged."""
-    if isinstance(value, dict) and value.get("type") == "image_url":
-        return (value.get("image_url") or {}).get("url")
+    if isinstance(value, dict) and value.get("type") == IMAGE_URL:
+        return (value.get(IMAGE_URL) or {}).get("url")
     return value
 
 

@@ -5,14 +5,14 @@ process, one request at a time, and what the leaderboard's maintainers time.
         --option checkpoint=path/to/checkpoint --out runs/karpo-decision
 
 Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or ``reversed``: ``karpo_decision.views``);
-``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false: the decoder
-projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with ``fp8``,
-single-question requests replay CUDA graphs captured at load, ``serve.graphs``; not with the ``blackwell`` extra's
-kernels); ``triton_attention`` (default false: the global layers' attention in one Triton kernel, sm_120 GPUs,
-bidirectional checkpoints and a ``max_length`` under 131,072 (31B) only, ``families.gemma.triton_attention``; answers
-move by bf16 noise). A path the checkpoint's backbone does not run is refused before loading (``serve.paths``).
-A request outside the contract, or with a question that does not fit ``max_length`` tokens with
-its state, is ``Unsupported``.
+``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false, the 31B only:
+the decoder projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with
+``fp8``, single-question requests replay CUDA graphs captured at load, ``serve.graphs``; not with the ``blackwell``
+extra's kernels); ``triton_attention`` (default false, the 31B only: the global layers' attention in one Triton kernel,
+sm_120 GPUs, bidirectional checkpoints and a ``max_length`` under 131,072 only, ``families.gemma.triton_attention``;
+answers move by bf16 noise). A path the checkpoint's backbone does not run is refused before loading
+(``serve.paths``). A request outside the contract, or with a question that does not fit ``max_length`` tokens with its
+state, is ``Unsupported``.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from ..protocol import RequestError
 from ..views import VIEWS, joined, views
 from . import graphs
 from .fp8 import quantize
-from .paths import require
+from .paths import FP8, GRAPHS, TRITON_ATTENTION, require
 
 
 class DecisionIndexEngine(Engine):
@@ -46,7 +46,7 @@ class DecisionIndexEngine(Engine):
                          triton_attention=triton_attention, **options)
         if view not in VIEWS:
             raise ValueError(f"view must be one of {VIEWS}")
-        for name, value in (("fp8", fp8), ("fast", fast), ("triton_attention", triton_attention)):
+        for name, value in ((FP8, fp8), ("fast", fast), (TRITON_ATTENTION, triton_attention)):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be true or false, not {value!r}")
         supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
@@ -59,7 +59,7 @@ class DecisionIndexEngine(Engine):
             enable_attention(decider.model, decider.max_length)
         if fp8:
             decider.decide(graphs.WARMUP_REQUEST)  # the fused kernels compile on it with or without graphs
-        graphed = fp8 and fast and "graphs" in supported and graphs.fast(decider)
+        graphed = fp8 and fast and GRAPHS in supported and graphs.fast(decider)
         self.decider = decider
         self.view = view
         self.path = "fp8-graphs" if graphed else "fp8" if fp8 else "plain"

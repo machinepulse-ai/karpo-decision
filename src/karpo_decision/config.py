@@ -11,13 +11,15 @@ from .protocol import QUESTION_TYPES
 
 CONFIG_FILE = "decision_config.json"
 FORMAT_VERSION = 1
-#: How the global (full-attention) layers see the prompt. The sliding-window layers are causal in both.
+#: How the full-attention (Qwen) or global (Gemma) layers see the prompt. The linear-attention and sliding-window
+#: layers are causal in both.
 Attention = Literal["causal", "bidirectional"]
 ATTENTIONS = ("causal", "bidirectional")
 #: The readout marker of Gemma checkpoints (``families.gemma.MARKER``): an existing special token that request text
 #: can never produce.
 DEFAULT_MARKER = "<mask>"
-#: The most pixels of an image.
+#: Image pixel bounds; the base model's vision tower reads images between these sizes.
+MIN_PIXELS = 65_536
 DEFAULT_MAX_PIXELS = 1_638_400
 
 

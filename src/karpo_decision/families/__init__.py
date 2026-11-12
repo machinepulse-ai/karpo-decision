@@ -5,7 +5,7 @@ A family is a subpackage with:
 
 - ``MODEL_TYPE``: the ``model_type`` of the backbone's ``config.json``, which picks the family;
 - ``MARKER``: the readout marker, an existing special token request text never produces;
-- ``TEMPLATES``: the template ids its attention reads (block layouts);
+- ``TEMPLATES``: the template ids its attention reads (joint layouts for Qwen, block layouts for Gemma);
 - ``load_processor(directory, max_pixels)``: the processor (tokenizer, chat template, images when the family reads
   them);
 - ``load_backbone(weights, dtype)``: the backbone module;
@@ -23,7 +23,7 @@ from pathlib import Path
 from types import ModuleType
 
 #: model_type -> subpackage
-FAMILIES = {"gemma4": "gemma", "gemma4_unified": "gemma"}
+FAMILIES = {"qwen3_5": "qwen", "gemma4": "gemma", "gemma4_unified": "gemma"}
 
 
 def model_type(weights: str | Path) -> str:

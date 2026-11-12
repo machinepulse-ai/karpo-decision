@@ -44,6 +44,18 @@ def test_engine_path(monkeypatch, options, applies, path, called, kernels):
     assert e.kernels == kernels and e.provenance["kernels"] == kernels and e.runtime()["kernels"] == kernels
 
 
+def test_engine_without_graphs_stays_on_fp8(monkeypatch):
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "triton_attention"}))
+    calls, loaded = [], decider()
+    loaded.decide = lambda request: calls.append("decide")
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    monkeypatch.setattr(engine, "quantize", lambda model: calls.append("quantize"))
+    monkeypatch.setattr(engine.graphs, "fast", lambda d: pytest.fail("graphs.fast called"))
+    monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)
+    assert e.path == "fp8" and calls == ["quantize", "decide"]
+
+
 def test_engine_refuses_a_non_boolean_fp8(monkeypatch):
     monkeypatch.setattr(engine.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, **_: pytest.fail("loaded")))

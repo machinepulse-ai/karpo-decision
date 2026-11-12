@@ -10,8 +10,11 @@ too long for the model gets 422, without reaching the other ranks; it hands the 
 request's encode, share (the hand-over) and model (passes, readout, answers) times in milliseconds. Each request is
 logged as one JSON line without content.
 
-A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the plain ``Decider`` (eager, exact lengths),
-warmed up with a text request, since Gemma reads text only.
+A Gemma 4 checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, its decoder projections in
+FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
+(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
+request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
+(sm_120 GPUs).
 """
 
 from __future__ import annotations
@@ -33,7 +36,10 @@ import torch.distributed as dist
 
 from ..decider import Decider
 from ..encoding import Encoded, LengthError
+from ..families.gemma.triton_attention import enable as enable_attention
 from ..protocol import Request, RequestError, images_of
+from . import graphs
+from .fp8 import quantize
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 #: What rank 0 sends the other ranks when the server stops.
@@ -46,16 +52,25 @@ def log(**fields: Any) -> None:
 
 def text_warmup_request() -> Request:
     """A tiny request without images, for a family that reads text only (Gemma)."""
-    return {"state": {"page": {"url": "about:blank"}},
-            "questions": {"blank": {"type": "noul", "instructions": "Is the page blank?"}}}
+    return graphs.WARMUP_REQUEST
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs the plain path on one GPU and
-    reads text only."""
+def load_decider(checkpoint: str, world: int, device: torch.device, fp8: bool = False,
+                 fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
+    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on one GPU, its decoder projections
+    in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
+    ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers' attention in
+    one Triton kernel (``families.gemma.triton_attention``)."""
     if world != 1:
         raise ValueError(f"a Gemma 4 checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
-    return Decider.from_pretrained(checkpoint, device=device), text_warmup_request()
+    decider = Decider.from_pretrained(checkpoint, device=device)
+    if fp8:
+        quantize(decider.model)
+    if triton_attention:
+        enable_attention(decider.model)
+    if fp8 and fast:
+        graphs.fast(decider)
+    return decider, text_warmup_request()
 
 
 def scrub(node: Any) -> Any:
@@ -204,6 +219,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
+    parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
+    parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
+    parser.add_argument("--triton-attention", action="store_true",
+                        help="the global layers' attention in one Triton kernel (sm_120)")
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
@@ -214,14 +233,17 @@ def main() -> None:
     # timeout would end them after the first quiet half hour.
     control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device)
+    decider, warmup = load_decider(args.checkpoint, world, device, fp8=args.fp8, fast=not args.no_fast,
+                                   triton_attention=args.triton_attention)
     loaded = time.time()
     decider.decide(warmup)
     ranks = Ranks(decider, control, device)
     if rank != 0:
         ranks.follow()
         os._exit(0)
-    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention}
+    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
+            "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
+            "kernels": ["triton-attention"] if args.triton_attention else []}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()

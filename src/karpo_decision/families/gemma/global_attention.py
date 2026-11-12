@@ -68,6 +68,17 @@ def lengths(q_bounds: list[int], k_bounds: list[int], device: torch.device) -> t
     return t.to(device)
 
 
+def padded(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cu: torch.Tensor, size: int, causal: bool,
+           scale: float) -> torch.Tensor:
+    """A pack padded for a CUDA graph: query (1, P, heads, D) over key and value (1, P, kv heads, D), each sequence
+    ``cu`` bounds (int32 on the device, read when the kernel runs) attending within itself, causal from its first row;
+    varlen memory-efficient attention, key and value heads repeated; (1, P, heads, D)."""
+    rep = query.shape[2] // key.shape[2]
+    key, value = key.repeat_interleave(rep, dim=2), value.repeat_interleave(rep, dim=2)
+    return torch.ops.aten._efficient_attention_forward(query, key, value, None, cu, cu, size, size, 0.0,
+                                                      1 if causal else 0, False, scale=scale)[0]
+
+
 def _bhsd(rows: torch.Tensor, size: int, front: bool) -> torch.Tensor:
     """(L, heads, D) rows padded with zeros to (1, size, heads, D), at its end (front padding) or start, as a
     (1, heads, size, D) view: rows stay heads-inner, the layout the kernels read without a staging copy. Only the

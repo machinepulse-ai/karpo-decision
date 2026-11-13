@@ -1,6 +1,8 @@
 """Requests laid out in blocks (``templates.BlockTemplate``): a shared block and one branch per question, as token ids
 with each token's position and segment, for a family whose attention keeps branches apart (Gemma).
 
+- A request's images (``protocol.images_of``) sit in the shared block, after the context header and before the state
+  text (``families/gemma/vision.py``); a checkpoint without a vision tower refuses them.
 - A request with one question is one block (segment 0, positions 0..n-1): its state reads its question and options.
 - With several questions, the shared block (segment 0: system turn, the list of every question's instructions, the
   state) comes once, then each question's branch (segment k for the k-th branch of the sequence) with positions
@@ -24,6 +26,9 @@ import torch
 
 from .protocol import Question, Request, describe, images_of, options
 from .templates import DEFAULT_INSTRUCTIONS, BlockTemplate
+
+#: The line before each image when a request has several (k from 1).
+IMAGE_LABEL = "Image {}:\n"
 
 
 class BlockLayout:
@@ -58,11 +63,22 @@ class BlockLayout:
     def instructions(self, question: Question) -> list[int]:
         return self.text(question.get("instructions") or DEFAULT_INSTRUCTIONS)
 
-    def shared(self, state: Any, questions: Sequence[Question]) -> list[int]:
+    def image_ids(self, images: Any) -> list[int]:
+        """The images' part of the shared block: each as ``begin``, ``soft`` x its soft tokens, ``end`` and a newline,
+        after an ``IMAGE_LABEL`` line when there are several."""
+        marks = self.encoder.processor.vision.tokens
+        ids: list[int] = []
+        for k, n in enumerate(images.tokens, start=1):
+            if len(images.tokens) > 1:
+                ids += self.tokenize(IMAGE_LABEL.format(k))
+            ids += [marks.begin, *[marks.soft] * n, marks.end, *self.newline]
+        return ids
+
+    def shared(self, state: Any, questions: Sequence[Question], images: Any = None) -> list[int]:
         ids = self.prefix + self.header
         for question in questions:
             ids += self.item + self.instructions(question) + self.newline
-        return ids + self.context + self.text(state)
+        return ids + self.context + (self.image_ids(images) if images is not None else []) + self.text(state)
 
     def branch(self, question: Question) -> list[int]:
         _, texts = options(question)
@@ -74,11 +90,15 @@ class BlockLayout:
     def plan(self, request: Request, max_length: int | None) -> list[Any]:
         from .encoding import Encoded, LengthError, TextOnlyError
 
-        state, images = images_of(request)
-        if images:
-            raise TextOnlyError("the block layout reads text only")
+        state, values = images_of(request)
+        images = None
+        if values:
+            vision = getattr(self.encoder.processor, "vision", None)
+            if vision is None:
+                raise TextOnlyError("this checkpoint reads text only")
+            images = vision.prepare(values)
         items = list(request["questions"].items())
-        shared = self.shared(state, [q for _, q in items])
+        shared = self.shared(state, [q for _, q in items], images)
         branches = [(key, len(options(q)[0]), self.branch(q)) for key, q in items]
         limit = max_length or float("inf")
 
@@ -86,7 +106,9 @@ class BlockLayout:
                      parts: list[tuple[str, int, list[int]]]) -> Encoded:
             return Encoded(keys=tuple(k for k, _, _ in parts), counts=tuple(c for _, c, _ in parts),
                            input_ids=torch.tensor(ids), markers=torch.tensor(markers),
-                           positions=torch.tensor(positions), segment_ids=torch.tensor(segments, dtype=torch.int16))
+                           positions=torch.tensor(positions), segment_ids=torch.tensor(segments, dtype=torch.int16),
+                           pixel_values=None if images is None else images.pixel_values,
+                           image_position_ids=None if images is None else images.position_ids)
 
         if len(items) == 1:
             ids = shared + branches[0][2]

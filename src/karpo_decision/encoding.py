@@ -30,7 +30,7 @@ class LengthError(ValueError):
 
 
 class TextOnlyError(ValueError):
-    """The request has images and the layout reads text only (the block layout, which the Gemma family reads)."""
+    """The request has images; this checkpoint reads text only."""
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,8 @@ class Encoded:
     pixel_values: torch.Tensor | None = None
     #: Joint layouts with images: each image's (t, h, w) grid of patches.
     image_grid_thw: torch.Tensor | None = None
+    #: Gemma 4: each image's patch positions (n, patches, 2), -1 on padding (``families/gemma/vision.py``).
+    image_position_ids: torch.Tensor | None = None
     #: Each token's position in the block layout (``blocks.py``; branches restart after the shared block) and segment
     #: (0 the shared block, k the k-th branch). None: positions 0..n-1, one segment.
     positions: torch.Tensor | None = None

@@ -10,7 +10,7 @@ Models:
 
 | Model | Backbone | Reads |
 |---|---|---|
-| [karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B) | Gemma 4 31B | text |
+| [karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B) | Gemma 4 31B | text, images |
 | [karpo-decision-12B](https://huggingface.co/MachinePulseAI/karpo-decision-12B) | Gemma 4 12B | text |
 | [karpo-decision-9B](https://huggingface.co/MachinePulseAI/karpo-decision-9B) | Qwen3.5 9B | text, a screenshot |
 | [karpo-decision-4B](https://huggingface.co/MachinePulseAI/karpo-decision-4B) | Qwen3.5 4B | text, a screenshot |
@@ -50,8 +50,9 @@ response = decider.decide({
 print(response["answers"])
 ```
 
-A Qwen3.5 checkpoint also reads a screenshot at `state.viewport_screenshot`, as an `image_url` part with a
-`data:image/...` URL.
+The 31B and the Qwen3.5 checkpoints also read a screenshot at `state.viewport_screenshot`, as an `image_url` part
+with a `data:image/...` URL. The 31B reads more images at `images` (data URLs; in Python also PIL images or file
+paths); each image takes up to 560 tokens of `--max-length` plus a few markers.
 
 ## Serving
 
@@ -62,8 +63,8 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 `--fp8` and `--triton-attention` are for the 31B; the 12B and the Qwen3.5 checkpoints serve the plain path.
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
-at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
-the graphs.
+at startup (a few minutes) for single-question text-only requests (not with the `blackwell` extra's kernels);
+`--no-fast` skips the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
@@ -87,6 +88,7 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
 
 `--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them).
 `--option triton_attention=true` is `--triton-attention`.
+`--option image_root=<dir>` is the directory the vision suite's image references are relative to.
 
 ## Layout
 
@@ -107,7 +109,8 @@ src/karpo_decision/
 
 ```bash
 uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
-.venv/bin/python -m pytest -q          # GPU, Gemma-base and KARPO_TOKENIZER (Qwen3.5) tests skip without them
+.venv/bin/python -m pytest -q          # GPU, Gemma-base, KARPO_TOKENIZER (Qwen3.5) and KARPO_GEMMA_TOKENIZER (a
+                                       # directory with the 31B's tokenizer and configs) tests skip without them
 .venv/bin/ruff check src tests
 ```
 

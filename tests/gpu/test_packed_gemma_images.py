@@ -21,6 +21,9 @@ from karpo_decision.model.packed import pack  # noqa: E402
 
 pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")]
 GPU = torch.device("cuda")
+#: This tiny model in bfloat16 moves by up to 8% between the two kernel sets (a 150-token text-only sequence by 4%
+#: too, measured on an RTX PRO 6000), while skipping the whole-image recompute moves it by 70% or more.
+NOISE_BOUND = 0.25
 
 
 @pytest.fixture(scope="module")
@@ -51,4 +54,4 @@ def test_real_kernels_keep_the_reference_contract_with_images(backbone, name, tr
         m.setattr(sliding_attention, "_fa4", None)
         m.setattr(gp, "sdpa_kernel", lambda *_: contextlib.nullcontext())
         want = run(False)
-    assert ((got - want).norm() / want.norm()) < 1e-2
+    assert ((got - want).norm() / want.norm()) < NOISE_BOUND

@@ -72,6 +72,42 @@ def sequence(before: int, prepared, after: int, branches=(), vocab=280):
                    pixel_values=prepared.pixel_values, image_position_ids=prepared.position_ids)
 
 
+def layout(shared, branches=None, vocab=280):
+    """A block layout from parts: an int is that many random text tokens, prepared images are each image as begin /
+    soft x n / end and a text token; ``shared`` the shared block's parts, ``branches`` each branch's (None: one
+    block)."""
+    torch.manual_seed(len(shared) + len(branches or ()))
+    pictures = []
+
+    def ids_of(parts):
+        ids = []
+        for part in parts:
+            if isinstance(part, int):
+                ids += torch.randint(3, vocab, (part,)).tolist()
+                continue
+            pictures.append(part)
+            for n in part.tokens:
+                ids += [TOKENS.begin, *[TOKENS.soft] * n, TOKENS.end, int(torch.randint(3, vocab, (1,)))]
+        return ids
+
+    ids = ids_of(shared)
+    n = len(ids)
+    pos, seg = list(range(n)), [0] * n
+    markers = [] if branches else [n - 1]
+    for k, parts in enumerate(branches or (), start=1):
+        more = ids_of(parts)
+        ids += more
+        pos += range(n, n + len(more))
+        seg += [k] * len(more)
+        markers.append(len(ids) - 1)
+    joined = vision.Vision.join(pictures) if pictures else None
+    return Encoded(keys=tuple(str(i) for i in range(len(markers))), counts=(2,) * len(markers),
+                   input_ids=torch.tensor(ids), markers=torch.tensor(markers), positions=torch.tensor(pos),
+                   segment_ids=torch.tensor(seg, dtype=torch.int16),
+                   pixel_values=None if joined is None else joined.pixel_values,
+                   image_position_ids=None if joined is None else joined.position_ids)
+
+
 def text_only(n: int):
     torch.manual_seed(n)
     return Encoded(keys=("t",), counts=(2,), input_ids=torch.randint(3, 280, (n,)), markers=torch.tensor([n - 1]),
@@ -106,6 +142,16 @@ LAYOUTS = {
                                    sequence(8, images(picture(7)), 2, branches=(7,)), text_only(15)],
     "image-at-a-sequence-start": lambda: [sequence(9, images(picture(8, (300, 900))), 2, branches=(4, 3)),
                                           sequence(0, images(picture(9)), 6)],
+    "image-in-a-branch": lambda: [layout([6], [[3, images(picture(20)), 4], [5]])],
+    "images-in-the-shared-block-and-two-branches": lambda: [
+        layout([5, images(picture(21)), 3], [[2, images(picture(22)), 2], [4, images(picture(23, (300, 900))), 3]])],
+    "branch-image-within-a-window-of-the-shared-block": lambda: [
+        layout([WINDOW + 10], [[7], [20, images(picture(24)), 5]])],
+    "branch-image-past-a-window-of-the-shared-block": lambda: [
+        layout([12], [[9], [WINDOW + 5, images(picture(25)), 2]])],
+    "one-block-text-then-an-image": lambda: [layout([7, images(picture(26)), 6])],
+    "branch-images-and-text-in-one-pack": lambda: [layout([4], [[images(picture(27)), 3]]), text_only(12),
+                                                   layout([3, images(picture(28))], [[2], [images(picture(29)), 2]])],
 }
 
 
@@ -154,3 +200,12 @@ def test_images_without_soft_tokens_are_refused(backbone, cpu_kernels):
     text = Encoded(**{**s.__dict__, "input_ids": torch.where(s.input_ids == TOKENS.soft, 5, s.input_ids)})
     with pytest.raises(ValueError, match="no image soft tokens"):
         gp.Packed(backbone, "bidirectional")(pack([text], None, CPU))
+
+
+def test_a_branch_image_sees_the_shared_window_and_its_own_branch_only():
+    s = layout([10], [[4], [3, images(picture(30)), 2]])
+    plan = vision.plan_images(s.input_ids, [0, s.length], s.segment_ids.int(), s.positions, TOKENS.soft, WINDOW, CPU)
+    ((start, end),) = plan.spans
+    seen = plan.keys[0].tolist()
+    assert seen == [*range(10), *range(14, end)]  # the shared block, then the second branch up to the image's end
+    assert start == 14 + 3 + 1 and plan.masks[0].shape == (end - start, len(seen))

@@ -133,32 +133,44 @@ def embed(backbone: Any, pixel_values: torch.Tensor, position_ids: torch.Tensor)
 
 @dataclass
 class ImagePlan:
-    """Each image's soft-token rows in a pack, for the sliding layers: queries ``[s, e)``, keys ``[k, e)`` (the window
-    before the image, within its sequence, and the image) and which keys each query sees, on the device."""
+    """Each image's soft-token rows in a pack, for the sliding layers: queries ``[s, e)``, the rows they may see as keys
+    (the window before the image within what its block reads, and the image itself) and which of those each query
+    sees, on the device."""
 
     rows: torch.Tensor  # every soft token's row, in pack order
-    spans: list[tuple[int, int, int]]  # (s, e, k) per image
-    masks: list[torch.Tensor]  # (e - s, e - k) bool per image
+    spans: list[tuple[int, int]]  # (s, e) per image
+    keys: list[torch.Tensor]  # key rows per image
+    masks: list[torch.Tensor]  # (e - s, keys) bool per image
 
 
-def plan_images(input_ids: torch.Tensor, bounds: list[int], soft: int, window: int,
-                device: torch.device) -> ImagePlan:
-    """``input_ids`` on CPU; ``bounds`` the pack's sequence boundaries; ``window`` the sliding layers' (a token and the
-    window - 1 before it). An image's soft tokens are one run (the layout puts ``begin`` and ``end`` around them).
-    Images sit in the shared block at the start of their sequence, so the key range never reaches a branch."""
+def plan_images(input_ids: torch.Tensor, bounds: list[int], segments: torch.Tensor, positions: torch.Tensor,
+                soft: int, window: int, device: torch.device) -> ImagePlan:
+    """``input_ids``, ``segments`` and ``positions`` on CPU, ``bounds`` the pack's sequence boundaries, ``window`` the
+    sliding layers' (a token and the window - 1 before it). An image's soft tokens are one run inside one block (the
+    layout puts ``begin`` and ``end`` around them). An image in a sequence's shared block (or its only block) sees the
+    rows before it within the window; one in a branch sees the shared block's rows within the window by position and its
+    branch's rows before it, as the branch's other tokens do (``blocks.py``), and its whole self in either case."""
     rows = (input_ids == soft).nonzero().flatten()
     if rows.numel() == 0:
         raise ValueError("a pack with images has no image soft tokens")
     breaks = ((rows[1:] != rows[:-1] + 1).nonzero().flatten() + 1).tolist()
-    spans, masks = [], []
+    spans, keys, masks = [], [], []
     for a, b in zip([0, *breaks], [*breaks, len(rows)], strict=True):
         s, e = int(rows[a]), int(rows[b - 1]) + 1
         if e - s > window:
             raise ValueError(f"an image of {e - s} soft tokens is longer than the sliding window ({window})")
-        k = max(bounds[bisect.bisect_right(bounds, s) - 1], s - (window - 1))
-        masks.append((torch.arange(k, e)[None, :] >= torch.arange(s, e)[:, None] - (window - 1)).to(device))
-        spans.append((s, e, k))
-    return ImagePlan(rows.to(device), spans, masks)
+        start = bounds[bisect.bisect_right(bounds, s) - 1]
+        if int(segments[s]) == 0:
+            seen = torch.arange(max(start, s - (window - 1)), e)
+        else:
+            shared = int((segments[start:s] == 0).sum())  # the shared block's length: positions restart after it
+            branch = s - (int(positions[s]) - shared)  # the branch's first row
+            first = min(max(0, int(positions[s]) - (window - 1)), shared)  # the first shared position it sees
+            seen = torch.cat([torch.arange(start + first, start + shared), torch.arange(branch, e)])
+        masks.append((positions[seen][None, :] >= positions[s:e][:, None] - (window - 1)).to(device))
+        keys.append(seen.to(device))
+        spans.append((s, e))
+    return ImagePlan(rows.to(device), spans, keys, masks)
 
 
 def see_whole(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, plan: ImagePlan,
@@ -167,9 +179,9 @@ def see_whole(out: torch.Tensor, query: torch.Tensor, key: torch.Tensor, value: 
     the window before it, as every token does, and its whole image (``query``, ``key``, ``value``: every row of the
     pack, keys not gathered)."""
     parts = []
-    for (s, e, k), mask in zip(plan.spans, plan.masks, strict=True):
+    for (s, e), rows, mask in zip(plan.spans, plan.keys, plan.masks, strict=True):
         q = query[s:e].transpose(0, 1)[None]
-        kk, vv = key[k:e].transpose(0, 1)[None], value[k:e].transpose(0, 1)[None]
+        kk, vv = (t.index_select(0, rows).transpose(0, 1)[None] for t in (key, value))
         seen = F.scaled_dot_product_attention(q, kk, vv, attn_mask=mask, scale=scale,
                                               enable_gqa=kk.shape[1] != q.shape[1])
         parts.append(seen[0].transpose(0, 1))

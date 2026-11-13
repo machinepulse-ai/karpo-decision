@@ -61,15 +61,18 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 ```
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
-`--fp8` and `--triton-attention` are for the 31B; the 12B and the Qwen3.5 checkpoints serve the plain path.
+`--fp8` runs on every checkpoint; `--triton-attention` on the Gemma checkpoints; `--graphs` (CUDA graphs on the bf16
+path, captured at startup) on the Qwen3.5 checkpoints.
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
-at startup (a few minutes) for single-question text-only requests (not with the `blackwell` extra's kernels);
-`--no-fast` skips the graphs.
+at startup (a few minutes; the layers are compiled first on Qwen3.5). Gemma: single-question text-only requests up to
+the Gemma graphs' limit, not with the `blackwell` extra's kernels. Qwen3.5: any request read as one sequence (several
+questions or a screenshot included) up to min(`--max-length`, 65,536) tokens. Other passes run the plain path.
+`--no-fast` with `--fp8` skips the graphs (ignored with `--graphs`).
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
-`--max-length` sets the longest sequence in tokens (default 32,768; under 131,072 with `--triton-attention`); a question
-that does not fit gets HTTP 422.
+`--max-length` sets the longest sequence in tokens (default 32,768; with `--triton-attention` the limit depends on the
+checkpoint, 131,072 tokens for the 31B); a question that does not fit gets HTTP 422.
 
 With Docker:
 
@@ -79,6 +82,22 @@ docker run --gpus all -v <checkpoint dir>:/checkpoint -p 18440:18440 karpo-decis
     torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint /checkpoint --host 0.0.0.0
 ```
 
+### Opt-in paths by checkpoint
+
+Same top answer as the plain path, and latency per request (median / mean), one request at a time on one GPU, over
+2,215 Decision Index requests:
+
+| Checkpoint | Plain | `--graphs` | `--fp8` | `--triton-attention` |
+|---|---|---|---|---|
+| 12B | 55 / 213 ms | | 99.1%, 30 / 146 ms | 99.8%, 47 / 185 ms |
+| 9B | 70 / 144 ms | 99.9%, 31 / 147 ms | 99.5%, 21 / 104 ms | |
+| 4B | 53 / 189 ms | 99.9%, 19 / 101 ms | 99.5%, 14 / 77 ms | |
+| 2B | 43 / 64 ms | 99.9%, 11 / 54 ms | 99.3%, 9 / 46 ms | |
+| 0.8B | 41 / 138 ms | 99.9%, 8 / 44 ms | 99.0%, 8 / 42 ms | |
+
+`--fp8` includes the CUDA graphs; with `--no-fast` it is slower than the plain path on the Qwen3.5 checkpoints.
+Capturing the graphs takes 2-4 minutes at startup.
+
 ## Decision Index
 
 ```bash
@@ -86,8 +105,10 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
     --option checkpoint=<checkpoint dir> --out runs/karpo-decision-31B
 ```
 
-`--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them).
+`--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them;
+ignored with `graphs=true`).
 `--option triton_attention=true` is `--triton-attention`.
+`--option graphs=true` is `--graphs`.
 `--option image_root=<dir>` is the directory the vision suite's image references are relative to.
 
 ## Layout

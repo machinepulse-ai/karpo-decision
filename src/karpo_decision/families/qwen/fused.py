@@ -51,11 +51,12 @@ def _rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 def _on_gpu(fn: Callable[..., Any], dims: tuple[int | None, ...]) -> Callable[..., Any]:
     """``fn`` compiled with only the token dimension symbolic: ``dims[i]`` is that dimension of argument ``i`` (None:
     a parameter, every dimension static). ``dynamic=True`` made every dimension symbolic, head sizes included, and the
-    kernels 3-5x slower (measured on Gemma's)."""
+    kernels 3-5x slower (measured on Gemma's). Inside an outer ``torch.compile`` (the CUDA graphs path compiles whole
+    layers), the op is traced into that graph as plain code."""
     compiled = torch.compile(fn)
 
     def run(*args: Any) -> Any:
-        if not args[0].is_cuda:
+        if not args[0].is_cuda or torch.compiler.is_compiling():
             return fn(*args)
         for t, dim in zip(args, dims, strict=False):
             if isinstance(t, torch.Tensor):

@@ -13,14 +13,18 @@ readout, answers) times in milliseconds. Each request is logged by the rank that
 content.
 
 A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
-Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower, ``families/gemma/vision.py``) and Qwen3.5 read
-images, and the 12B reads text only. The 31B alone runs the opt-in paths, which ``serve.paths`` refuses for the others
-at startup: ``--fp8`` runs its decoder projections in FP8 (``serve.fp8``) and replays CUDA graphs captured at load for
-single-question text-only requests (``serve.graphs``, skipped with ``--no-fast`` or the ``blackwell`` extra's
-kernels), and ``--triton-attention`` runs the global layers' attention in one Triton kernel (sm_120 GPUs).
+Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
+``families/gemma/vision.py``) and Qwen3.5 read images, and the 12B reads text only. The opt-in paths are refused by
+``serve.paths`` at startup for a backbone that does not run them: ``--fp8`` runs the decoder projections in FP8
+(Gemma: ``serve.fp8``; Qwen3.5: ``serve.qwen_fp8``) and replays CUDA graphs captured at load (Gemma:
+single-question text-only requests up to the graphs' limit, ``serve.graphs``, not with the ``blackwell`` extra's
+kernels; Qwen3.5: any request read as one sequence up to min(``--max-length``, 65,536) tokens, ``serve.qwen_graphs``,
+captured after compiling the layers; other passes run the plain path), skipped with ``--fp8 --no-fast``;
+``--graphs`` captures the Qwen3.5 graphs on the bf16 path; ``--triton-attention`` runs Gemma's global layers'
+attention in one Triton kernel (sm_120 GPUs).
 
-``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
-131,072 for the 31B).
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention`` the
+limit depends on the checkpoint: 131,072 for the 31B).
 """
 
 from __future__ import annotations
@@ -47,11 +51,15 @@ from ..config import DecisionConfig
 from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
+from ..families.qwen import MODEL_TYPE as QWEN
 from ..protocol import IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
 from ..templates import BLOCKS, template
-from . import graphs
+from . import graphs, qwen_fp8, qwen_graphs
 from .fp8 import quantize
-from .paths import GRAPHS, require
+from .paths import GRAPHS, backbone_type, path_name, require
+
+#: ``graphs`` is also an option of ``load_decider``, which would hide the module there.
+gemma_graphs = graphs
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 #: The screenshot warm-up: a blank page as a JPEG data URL in the state, with one question.
@@ -97,25 +105,33 @@ def warmup_request(checkpoint: str) -> Request:
     """The request that warms a checkpoint up: text for a block layout, a screenshot for a joint layout
     (Qwen)."""
     if template(DecisionConfig.load(checkpoint).template).kind == BLOCKS:
-        return graphs.WARMUP_REQUEST
+        return gemma_graphs.WARMUP_REQUEST
     return screenshot_request()
 
 
 def load_decider(checkpoint: str, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
-                 fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
+                 fp8: bool = False, fast: bool = True, triton_attention: bool = False,
+                 graphs: bool = False) -> tuple[Decider, Request]:
     """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on its
-    GPU. ``fp8``: the decoder projections in FP8, and single-question requests replaying CUDA graphs unless ``fast``
-    is false, the ``blackwell`` extra's kernels run or the backbone has no graphs. ``triton_attention``: the global
+    GPU. ``fp8``: the decoder projections in FP8, and CUDA graphs unless ``fast`` is false (``fast`` applies to ``fp8``
+    alone) or the backbone has none. Gemma: single-question text-only requests up to the graphs' limit, not with the
+    ``blackwell`` extra's kernels. Qwen3.5: any request read as one sequence (several questions or a screenshot
+    included) up to min(``max_length``, 65,536) tokens, captured after compiling the layers (minutes); other passes run
+    the plain path. ``graphs``: CUDA graphs on the bf16 path (Qwen3.5). ``triton_attention``: the global
     layers' attention in one Triton kernel (``families.gemma.triton_attention``). A path the backbone does not run is
     refused before loading (``serve.paths``)."""
-    supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
+    supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention, graphs=graphs)
+    qwen = backbone_type(checkpoint) == QWEN
     decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
     if fp8:
-        quantize(decider.model)
+        (qwen_fp8.quantize if qwen else quantize)(decider.model)
     if triton_attention:
         enable_attention(decider.model, max_length)
-    if fp8 and fast and GRAPHS in supported:
-        graphs.fast(decider)
+    if qwen:
+        if graphs or (fp8 and fast):
+            qwen_graphs.fast(decider)
+    elif fp8 and fast and GRAPHS in supported:
+        gemma_graphs.fast(decider)
     return decider, warmup_request(checkpoint)
 
 
@@ -340,7 +356,8 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
     parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
-    parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
+    parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs (ignored with --graphs)")
+    parser.add_argument("--graphs", action="store_true", help="CUDA graphs on the bf16 path (Qwen3.5)")
     parser.add_argument("--triton-attention", action="store_true",
                         help="the global layers' attention in one Triton kernel (sm_120)")
     parser.add_argument("--max-length", type=positive, default=DEFAULT_MAX_LENGTH,
@@ -356,11 +373,12 @@ def main() -> None:
     torch.cuda.set_device(device)
     started = time.time()
     decider, warmup = load_decider(args.checkpoint, device, args.max_length, fp8=args.fp8,
-                                   fast=not args.no_fast, triton_attention=args.triton_attention)
+                                   fast=not args.no_fast, triton_attention=args.triton_attention,
+                                   graphs=args.graphs)
     loaded = time.time()
     decider.decide(warmup)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
-            "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
+            "path": path_name(args.fp8, isinstance(decider.model, (gemma_graphs.Graphs, qwen_graphs.CudaGraphs))),
             "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     replicas = None

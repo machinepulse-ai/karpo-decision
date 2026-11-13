@@ -2,7 +2,8 @@
 graphs' warmup request answered, then CUDA graphs unless ``fast=false`` or the graphs do not apply; a non-boolean
 ``fp8``, ``fast`` or ``triton_attention`` is refused before loading. No GPU and no weights: the loader, the
 quantization and the capture are replaced. ``triton_attention`` enables the Triton global attention, for the
-decider's ``max_length``, after the quantization and before the warmup."""
+decider's ``max_length``, after the quantization and before the warmup. A Qwen3.5 checkpoint quantizes with its own
+module and captures its graphs with ``graphs=true`` or ``fp8=true`` (no warm-up decide first)."""
 
 import sys
 import types
@@ -11,7 +12,14 @@ import pytest
 
 pytest.importorskip("decision_index")
 from karpo_decision.encoding import TextOnlyError  # noqa: E402
-from karpo_decision.serve import engine  # noqa: E402
+from karpo_decision.serve import engine, paths  # noqa: E402
+
+GEMMA, QWEN = "gemma4", "qwen3_5"
+
+
+@pytest.fixture(autouse=True)
+def gemma_backbone(monkeypatch):
+    monkeypatch.setattr(engine, "backbone_type", lambda checkpoint: GEMMA)
 
 
 def decider():
@@ -154,3 +162,35 @@ def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(mo
     e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
     with pytest.raises(engine.Unsupported, match="TextOnlyError"):
         e({}, {"q": {"type": "noul", "instructions": "Blank?"}}, images=["img/0.jpg"])
+
+
+@pytest.mark.parametrize(("options", "path", "called"),
+                         [({"graphs": True}, "graphs", ["fast"]),
+                          ({"graphs": True, "fast": False}, paths.GRAPHS_PATH, ["fast"]),
+                          ({"fp8": True}, "fp8-graphs", ["quantize", "fast"]),
+                          ({"fp8": True, "graphs": True}, paths.FP8_GRAPHS_PATH, ["quantize", "fast"]),
+                          ({"fp8": True, "fast": False}, "fp8", ["quantize"]),
+                          ({}, "plain", [])],
+                         ids=["graphs", "graphs-no-fast", "fp8", "fp8-graphs", "fp8-no-fast", "bf16"])
+def test_qwen_engine_path(monkeypatch, options, path, called):
+    opt_in = frozenset({paths.FP8, paths.GRAPHS, paths.BF16_GRAPHS})
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: opt_in)
+    monkeypatch.setattr(engine, "backbone_type", lambda checkpoint: QWEN)
+    calls, loaded = [], decider()
+    loaded.decide = lambda request: pytest.fail("warm-up decide")
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    monkeypatch.setattr(engine.qwen_fp8, "quantize", lambda model: calls.append(("quantize", model)))
+    monkeypatch.setattr(engine.qwen_graphs, "fast", lambda d: calls.append(("fast", d)) or True)
+    monkeypatch.setattr(engine, "quantize", lambda model: pytest.fail("Gemma FP8"))
+    monkeypatch.setattr(engine.graphs, "fast", lambda d: pytest.fail("Gemma graphs"))
+    monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", **options)
+    received = {"quantize": loaded.model, "fast": loaded}
+    assert e.path == path and e.provenance["path"] == path and calls == [(name, received[name]) for name in called]
+
+
+def test_engine_refuses_a_non_boolean_graphs(monkeypatch):
+    monkeypatch.setattr(engine.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="graphs"):
+        engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", graphs="true")

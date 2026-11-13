@@ -1,9 +1,12 @@
 """The packed forward with images against Transformers' own text model on the same input embeddings, on a tiny random
 Gemma 4 with a vision tower on CPU (float64): rule A's masks, and each image's soft tokens seeing their whole image in
 the sliding layers (the window is longer than an image, as in the 31B). One block and branches, two images, text
-before an image longer than the window, two parts of one request in one pack."""
+before an image longer than the window, two sequences with images and a text-only one in one pack, an image at the start
+of a sequence that follows another. Every picture is its own seeded noise, so a feature written at the wrong row or in
+another sequence shows."""
 
 import contextlib
+import random
 
 import pytest
 import torch
@@ -35,9 +38,15 @@ def cpu_kernels(monkeypatch):
     monkeypatch.setattr(gp, "sdpa_kernel", lambda *_: contextlib.nullcontext())
 
 
-def images(*sizes):
-    return vision.Vision(TOKENS, max_soft_tokens=SMALL).prepare(
-        [Image.new("RGB", size, (37 * i % 255, 90, 160)) for i, size in enumerate(sizes, start=1)])
+def picture(seed: int, size=(640, 480)):
+    """Seeded random pixels: each soft token of the image, and each picture, gets its own features (a solid picture
+    gives every soft token the same one)."""
+    width, height = size
+    return Image.frombytes("RGB", size, random.Random(seed).randbytes(width * height * 3))
+
+
+def images(*pictures):
+    return vision.Vision(TOKENS, max_soft_tokens=SMALL).prepare(list(pictures))
 
 
 def sequence(before: int, prepared, after: int, branches=(), vocab=280):
@@ -89,12 +98,14 @@ def reference(model, seqs, bidir):
 
 
 LAYOUTS = {
-    "one-block": lambda: [sequence(12, images((640, 480)), 9)],
-    "branches": lambda: [sequence(7, images((640, 480)), 5, branches=(6, 9, 4))],
-    "two-images": lambda: [sequence(5, images((640, 480), (300, 900)), 8, branches=(5,))],
-    "text-past-the-window": lambda: [sequence(WINDOW + 30, images((500, 500)), 4)],
-    "two-parts-and-text": lambda: [sequence(6, images((640, 480)), 3, branches=(5,)),
-                                   sequence(6, images((640, 480)), 3, branches=(7,)), text_only(15)],
+    "one-block": lambda: [sequence(12, images(picture(1)), 9)],
+    "branches": lambda: [sequence(7, images(picture(2)), 5, branches=(6, 9, 4))],
+    "two-images": lambda: [sequence(5, images(picture(3), picture(4, (300, 900))), 8, branches=(5,))],
+    "text-past-the-window": lambda: [sequence(WINDOW + 30, images(picture(5, (500, 500))), 4)],
+    "two-parts-and-text": lambda: [sequence(6, images(picture(6)), 3, branches=(5,)),
+                                   sequence(8, images(picture(7)), 2, branches=(7,)), text_only(15)],
+    "image-at-a-sequence-start": lambda: [sequence(9, images(picture(8, (300, 900))), 2, branches=(4, 3)),
+                                          sequence(0, images(picture(9)), 6)],
 }
 
 
@@ -110,8 +121,8 @@ def test_packed_images_match_transformers(backbone, cpu_kernels, name):
 
 def test_the_images_change_the_answer(backbone, cpu_kernels):
     """The soft tokens' rows carry the images: another picture of the same size gives another readout."""
-    a = sequence(6, images((640, 480)), 4)
-    other = vision.Vision(TOKENS, max_soft_tokens=SMALL).prepare([Image.new("RGB", (640, 480), (250, 250, 10))])
+    a = sequence(6, images(picture(10)), 4)
+    other = images(picture(11))
     b = Encoded(**{**a.__dict__, "pixel_values": other.pixel_values, "image_position_ids": other.position_ids})
     packed = gp.Packed(backbone, "bidirectional")
     with torch.inference_mode():
@@ -121,18 +132,25 @@ def test_the_images_change_the_answer(backbone, cpu_kernels):
 def test_images_need_a_bidirectional_checkpoint(backbone, cpu_kernels):
     """A causal checkpoint's global layers would not let a soft token see the rest of its image."""
     with pytest.raises(ValueError, match="bidirectional"):
-        gp.Packed(backbone, "causal")(pack([sequence(6, images((640, 480)), 4)], None, CPU))
+        gp.Packed(backbone, "causal")(pack([sequence(6, images(picture(12)), 4)], None, CPU))
 
 
 def test_an_image_longer_than_the_window_is_refused(cpu_kernels):
     small = tiny_backbone(16)
     with pytest.raises(ValueError, match="sliding window"):
-        gp.Packed(small, "bidirectional")(pack([sequence(3, images((640, 480)), 3)], None, CPU))
+        gp.Packed(small, "bidirectional")(pack([sequence(3, images(picture(13)), 3)], None, CPU))
 
 
 def test_soft_tokens_and_features_must_agree(backbone, cpu_kernels):
-    s = sequence(6, images((640, 480)), 4)
+    s = sequence(6, images(picture(14)), 4)
     short = Encoded(**{**s.__dict__, "input_ids": torch.where(s.input_ids == TOKENS.soft, 5, s.input_ids)})
     short.input_ids[7] = TOKENS.soft
     with pytest.raises(ValueError, match="soft tokens"):
         gp.Packed(backbone, "bidirectional")(pack([short], None, CPU))
+
+
+def test_images_without_soft_tokens_are_refused(backbone, cpu_kernels):
+    s = sequence(6, images(picture(15)), 4)
+    text = Encoded(**{**s.__dict__, "input_ids": torch.where(s.input_ids == TOKENS.soft, 5, s.input_ids)})
+    with pytest.raises(ValueError, match="no image soft tokens"):
+        gp.Packed(backbone, "bidirectional")(pack([text], None, CPU))

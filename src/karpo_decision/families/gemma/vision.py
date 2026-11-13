@@ -87,6 +87,8 @@ def plan_images(input_ids: torch.Tensor, bounds: list[int], soft: int, window: i
     """``input_ids`` on CPU; ``bounds`` the pack's sequence boundaries; ``window`` the sliding layers' (a token and the
     window - 1 before it). An image's soft tokens are one run (the layout puts ``begin`` and ``end`` around them)."""
     rows = (input_ids == soft).nonzero().flatten()
+    if rows.numel() == 0:
+        raise ValueError("a pack with images has no image soft tokens")
     breaks = ((rows[1:] != rows[:-1] + 1).nonzero().flatten() + 1).tolist()
     spans, masks = [], []
     for a, b in zip([0, *breaks], [*breaks, len(rows)], strict=True):

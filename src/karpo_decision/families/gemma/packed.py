@@ -29,7 +29,7 @@ embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are 
 
 A pack with images (``families/gemma/vision.py``) gets the vision tower's soft-token embeddings at the soft tokens'
 rows; in the sliding layers each image's soft tokens are recomputed after the varlen call so that they see their whole
-image (Gemma 4's bidirectional images; an image is shorter than the window).
+image (Gemma 4's bidirectional images; an image is no longer than the window).
 """
 
 from __future__ import annotations
@@ -229,12 +229,12 @@ class Packed(PackedLayers):
         query = self._q(attn, x, cos, sin)
         key, value = self._kv(attn, x, cos, sin)
         if attn.is_sliding:
-            whole = key, value
+            whole = (key[0], value[0]) if plan.images is not None else None
             key, value = self._gather(key, value, plan.s_rows)
             out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
                                            plan.max_s, attn.scaling, self.sliding[0])
             if plan.images is not None:
-                out = vision.see_whole(out, query[0], whole[0][0], whole[1][0], plan.images, attn.scaling)
+                out = vision.see_whole(out, query[0], whole[0], whole[1], plan.images, attn.scaling)
             out = out.reshape(x.shape[1], -1)
         elif self.global_attend is not None:
             if isinstance(plan, PaddedPlan):

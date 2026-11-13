@@ -12,7 +12,7 @@ import pytest
 from karpo_decision.assets import resolve
 from karpo_decision.encoding import LengthError
 from karpo_decision.protocol import validate
-from karpo_decision.serve import server
+from karpo_decision.serve import server, wire
 
 zstd = pytest.importorskip("compression.zstd" if sys.version_info >= (3, 14) else "backports.zstd")
 
@@ -160,3 +160,18 @@ def test_multipart_rules_answer_400(post):
     assert status == 400 and "exactly one asset" in body["error"]["message"]
     status, _ = post({"state": "<a>", "questions": {"q": QUESTION}, "assets": {"<a>": {"part": "asset-0"}}})
     assert status == 400
+
+
+def test_a_text_state_with_an_object_typed_image_url_stays_text(post):
+    status, _ = post({"state": {"form": [{"name": "avatar", "type": "image_url"}]}, "questions": {"q": QUESTION}})
+    assert status == 200
+
+
+def test_a_claimed_asset_of_another_type_answers_422(post):
+    headers, data = multipart({"state": "<a>", "questions": {"q": QUESTION},
+                               "assets": {"<a>": {"type": "video", "part": "asset-0"}}}, [("asset-0", b"x")])
+    assert post(None, headers, data)[0] == 422
+
+
+def test_a_body_of_too_many_gzip_members_answers_400(post):
+    assert post(None, {"Content-Encoding": "gzip"}, gzip.compress(b" ") * (wire.MAX_MEMBERS + 1))[0] == 400

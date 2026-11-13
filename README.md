@@ -110,8 +110,8 @@ included:
   `{"type": "image", "part": "asset-0"}`.
 - `image_url` parts with a `data:image/...` URL anywhere in the state, the instructions or the criteria.
 - An image sits where it is referenced: in the state text, or in its question's branch, where the shared list of
-  questions shows `[image]`; each reference is one copy. `state.viewport_screenshot` and `images` still come before
-  the state text.
+  questions shows `[image]`; each reference is one copy. `state.viewport_screenshot` (unless it holds an asset key)
+  and `images` still come before the state text.
 - Bodies of up to 32 MiB, compressed and decompressed, with one `Content-Encoding`: `gzip`, `x-gzip` or `zstd`.
 - 422 for a request outside the contract (a `box` question included) or too long; 400 for a body, image or asset it
   cannot read or an asset rule it breaks (an unreferenced asset, an unclaimed part); 413 for a larger body; 415 for

@@ -56,3 +56,11 @@ def test_the_sdk_sends_an_image_asset_and_reads_the_answers(client):
     assert response.usage.input_tokens == 600
     assert Ranks.decider.seen["assets"] == {str(image): {"type": "image", "data": IMAGE}}
     assert Ranks.decider.resolved.inline == [IMAGE, IMAGE]
+
+
+def test_an_image_at_the_screenshot_field_is_placed_like_any_reference(client):
+    image = typesafe_sdk.Image(IMAGE)
+    client.system_one(state={"viewport_screenshot": image, "page": "checkout"},
+                      questions={"open": {"type": "noul", "instructions": "Is the dialog open?"}})
+    assert Ranks.decider.seen["state"]["viewport_screenshot"] == str(image)
+    assert Ranks.decider.resolved.legacy == [] and Ranks.decider.resolved.inline == [IMAGE]

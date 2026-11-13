@@ -5,7 +5,7 @@ import base64
 
 import pytest
 
-from karpo_decision.assets import AssetError, resolve
+from karpo_decision.assets import AssetError, places_images, resolve
 from karpo_decision.protocol import describe
 
 DATA = b"\x89PNG not decoded here"
@@ -87,7 +87,7 @@ def test_raw_bytes_and_wrapped_base64():
     (request("<k>", assets={"<k>": {"type": "image", "part": "asset-0"}}), "multipart"),
     (request("<k>", assets={"<k>": {"format": "png", "data_base64": "%%%"}}), "not base64"),
     (request({"shot": {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}}), "data:image"),
-    (request({"shot": {"type": "image_url", "image_url": "data:image/png;base64,AA"}}), "data:image"),
+    (request({"shot": {"type": "image_url", "image_url": {}}}), "data:image"),
 ])
 def test_rule_breaks_are_asset_errors(body, message):
     with pytest.raises(AssetError, match=message):
@@ -121,3 +121,32 @@ def test_a_joint_layout_refuses_inline_images():
         encoder.plan(request("<k>", assets={"<k>": asset()}), None)
     with pytest.raises(PlacementError):
         encoder.plan(request({"shot": PART}), None)
+
+
+def test_only_a_dict_whose_image_url_is_an_object_is_an_image_part():
+    state = {"form": [{"name": "avatar", "type": "image_url"}], "raw": {"type": "image_url", "image_url": URL}}
+    r = resolve(request(state))
+    assert r.inline == [] and r.state == state
+
+
+def test_a_reference_at_the_screenshot_field_is_an_inline_image():
+    r = resolve({"state": {"viewport_screenshot": "<k>", "page": "x"}, "questions": {"q": QUESTION},
+                 "assets": {"<k>": asset()}})
+    assert r.legacy == [] and r.inline == [DATA] and r.pieces(r.state["viewport_screenshot"]) == [0]
+
+
+def test_a_block_placing_more_images_than_its_limit_fails_before_the_rest_are_placed():
+    from karpo_decision.encoding import LengthError
+
+    with pytest.raises(LengthError, match="more than 10 images"):
+        resolve(request("a" * 100_000, assets={"a": asset()}), max_images=10)
+    questions = {key: {"type": "noul", "instructions": "a" * 10} for key in ("x", "y")}
+    assert len(resolve(request("a" * 10, questions, {"a": asset()}), max_images=10).inline) == 30
+
+
+def test_places_images_without_placing_them():
+    assert places_images(request("text", assets={"<k>": asset()}))
+    assert places_images(request({"shot": PART}))
+    assert places_images(request("t", {"q": {**QUESTION, "criteria": {"true": PART}}}))
+    assert not places_images({"state": {"viewport_screenshot": PART}, "questions": {"q": QUESTION}, "images": [URL]})
+    assert not places_images(request({"form": {"type": "image_url", "name": "avatar"}}))

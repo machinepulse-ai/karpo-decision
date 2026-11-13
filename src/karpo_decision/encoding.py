@@ -145,9 +145,9 @@ class Encoder:
         validate(request, len(self.codes))
         if self.blocks is not None:
             return self.blocks.plan(request, max_length)
-        from .assets import resolve
+        from .assets import places_images
 
-        if resolve(request).inline:
+        if places_images(request):
             raise PlacementError("this checkpoint reads images at state.viewport_screenshot and images only")
 
         def split(items: list[tuple[str, Question]]) -> list[Encoded]:

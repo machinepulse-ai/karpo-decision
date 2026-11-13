@@ -34,6 +34,9 @@ from .templates import DEFAULT_INSTRUCTIONS, BlockTemplate
 IMAGE_LABEL = "Image {}:\n"
 #: What the shared block's list of questions shows for an image in a question's instructions.
 IMAGE_PLACEHOLDER = "[image]"
+#: The fewest ids an image takes (``begin``, one soft token, ``end``): with ``max_length`` it bounds the images the
+#: state or one question may place before any is read.
+MIN_IMAGE_IDS = 3
 
 
 class Reader:
@@ -106,9 +109,10 @@ class BlockLayout:
 
     def listed(self, question: Question, reader: Reader | None = None) -> list[int]:
         """A question's instructions as the shared block lists them: each inline image as ``IMAGE_PLACEHOLDER``."""
+        if reader is None:
+            return self.instructions(question)
         text = describe(question.get("instructions") or DEFAULT_INSTRUCTIONS)
-        if reader is not None:
-            text = "".join(IMAGE_PLACEHOLDER if isinstance(p, int) else p for p in reader.resolved.pieces(text))
+        text = "".join(IMAGE_PLACEHOLDER if isinstance(p, int) else p for p in reader.resolved.pieces(text))
         return self.tokenize(self.encoder.escape(text))
 
     def instructions(self, question: Question) -> list[int]:
@@ -164,7 +168,7 @@ class BlockLayout:
         from .assets import resolve
         from .encoding import Encoded, LengthError, TextOnlyError
 
-        resolved = resolve(request)
+        resolved = resolve(request, max_length // MIN_IMAGE_IDS if max_length else None)
         vision = getattr(self.encoder.processor, "vision", None)
         if vision is None and (resolved.legacy or resolved.inline):
             raise TextOnlyError("this checkpoint reads text only")

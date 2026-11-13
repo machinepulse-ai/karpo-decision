@@ -238,3 +238,9 @@ def test_inline_images_count_in_the_length_and_stop_the_reading_early(encoder, m
     with pytest.raises(LengthError, match="images need"):
         encoder.plan(many, 2 * n + 2)  # one image with its markers fits, the second passes the limit
     assert len(read) == 2
+
+
+def test_a_key_repeated_past_the_length_limit_fails_before_its_images_are_placed(encoder):
+    request = {"state": "a" * 100_000, "questions": {"q": QUESTION}, "assets": {"a": asset(png())}}
+    with pytest.raises(LengthError, match="more than 1000 images"):
+        encoder.plan(request, 3_000)

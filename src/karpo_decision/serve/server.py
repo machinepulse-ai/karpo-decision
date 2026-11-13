@@ -237,8 +237,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(413, f"body is larger than {MAX_BODY_BYTES} bytes", close=True)
         decider = self.server.ranks.decider
         try:
-            raw = wire.inflate(self.rfile.read(int(length)), self.headers.get("Content-Encoding"), MAX_BODY_BYTES)
-            content_type = self.headers.get("Content-Type", "")
+            raw = wire.inflate(self.rfile.read(int(length)), self.headers.get(wire.CONTENT_ENCODING), MAX_BODY_BYTES)
+            content_type = self.headers.get(wire.CONTENT_TYPE, "")
             parts: dict[str, bytes] = {}
             if content_type.split(";")[0].strip().lower() == wire.MULTIPART:
                 raw, parts = wire.parse_multipart(raw, content_type)

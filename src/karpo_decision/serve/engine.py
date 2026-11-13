@@ -16,8 +16,9 @@ move by bf16 noise); ``image_root`` (default none: the directory the kit's image
 the kit's loader and its pixel cap). A path the checkpoint's backbone does not run is refused before loading
 (``serve.paths``).
 
-A request outside the contract, with an image that cannot be read, or with a question that does not fit ``max_length``
-tokens with its state and images is ``Unsupported``, and so is a request with images on the 12B, which reads text only.
+A request outside the contract, with an image that cannot be read or that breaks a rule of placed images
+(``assets.py``), or with a question that does not fit ``max_length`` tokens with its state and images is
+``Unsupported``, and so is a request with images on the 12B, which reads text only.
 On the 31B a request with images (the vision suite) runs through the backbone's vision tower
 (``families/gemma/vision.py``) and its meta reports the images' pixels and soft tokens; a checkpoint without that Gemma
 vision unit returns meta None (Qwen3.5 reads images through its own layout).
@@ -32,8 +33,9 @@ from typing import Any
 import torch
 from decision_index.engines import Engine, Unsupported
 
+from ..assets import AssetError
 from ..decider import DEFAULT_MAX_LENGTH, Decider
-from ..encoding import LengthError, TextOnlyError
+from ..encoding import LengthError, PlacementError, TextOnlyError
 from ..families.gemma import vision
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..families.qwen import MODEL_TYPE as QWEN
@@ -105,7 +107,7 @@ class DecisionIndexEngine(Engine):
                 request["images"] = [kit_images.pil(ref, self.image_root, kit_images.MAX_PIXELS) for ref in images]
             readings = views(request, self.view)
             plans = [self.decider.plan(reading) for reading in readings]
-        except (RequestError, LengthError, TextOnlyError, OSError) as error:
+        except (RequestError, LengthError, TextOnlyError, AssetError, PlacementError, OSError) as error:
             raise Unsupported(f"{type(error).__name__}: {error}") from error
         self.last_encode_ms = (time.perf_counter() - start) * 1000
         response = {"model": self.name, **joined(request, self.decider.decide(readings, plans), self.view)}

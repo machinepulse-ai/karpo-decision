@@ -6,7 +6,7 @@ and ``images`` (``protocol.images_of``) stay legacy images. Nothing here reads p
 
 Matching follows TypeSafe: only string values are searched, never object keys; in each string the leftmost match
 wins, the longest key where several start, and matches do not overlap (a string that is a key is one match). Each
-asset must be referenced."""
+asset must be referenced. An image part is a dict of type ``image_url`` whose ``image_url`` is an object."""
 
 from __future__ import annotations
 
@@ -17,7 +17,19 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .protocol import ASSETS, DATA, DATA_BASE64, IMAGE_DATA_URL, IMAGE_URL, PART, Question, Request, images_of
+from .protocol import (
+    ASSETS,
+    DATA,
+    DATA_BASE64,
+    IMAGE_DATA_URL,
+    IMAGE_URL,
+    PART,
+    TYPE,
+    URL,
+    Question,
+    Request,
+    images_of,
+)
 
 #: Around a sentinel: Unicode private-use characters, which JSON rendering and the escaping leave as they are.
 SENTINEL_OPEN, SENTINEL_CLOSE = chr(0xE000), chr(0xE001)
@@ -49,10 +61,10 @@ class Resolved:
 
 
 class _Finder:
-    """One request's inline images, found in order (``walk``)."""
+    """One request's inline images, found in order (``walk``); at most ``limit`` in the state or in one question."""
 
-    def __init__(self, assets: dict[str, Any]) -> None:
-        self.assets = assets
+    def __init__(self, assets: dict[str, Any], limit: int | None) -> None:
+        self.assets, self.limit, self.count = assets, limit, 0
         self.nonce = uuid.uuid4().hex
         keys = sorted(assets, key=len, reverse=True)
         self.keys = re.compile("|".join(map(re.escape, keys))) if keys else None
@@ -63,7 +75,7 @@ class _Finder:
         if isinstance(value, str):
             return value if self.keys is None else self.keys.sub(lambda m: self.place(self.asset(m.group())), value)
         if isinstance(value, dict):
-            if value.get("type") == IMAGE_URL:
+            if _is_part(value):
                 return self.place(_data_url(value))
             return {key: self.walk(item) for key, item in value.items()}
         if isinstance(value, list):
@@ -71,6 +83,12 @@ class _Finder:
         return value
 
     def place(self, source: Any) -> str:
+        self.count += 1
+        if self.limit is not None and self.count > self.limit:
+            from .encoding import LengthError
+
+            raise LengthError(f"the state or one question places more than {self.limit} images, more than the "
+                              "length limit holds")
         self.inline.append(source)
         return f"{SENTINEL_OPEN}{self.nonce}:{len(self.inline) - 1}{SENTINEL_CLOSE}"
 
@@ -80,14 +98,19 @@ class _Finder:
         return self.data[key]
 
 
-def resolve(request: Request) -> Resolved:
-    """``request`` (validated) with each inline image replaced by a sentinel; ``AssetError`` when it breaks a rule."""
+def resolve(request: Request, max_images: int | None = None) -> Resolved:
+    """``request`` (validated) with each inline image replaced by a sentinel; ``AssetError`` when it breaks a rule, and
+    ``encoding.LengthError`` as soon as the state or one question places more than ``max_images`` images (more than
+    its length limit could hold), before the rest are placed."""
     state, legacy = images_of(request)
     assets = request.get(ASSETS) or {}
-    finder = _Finder(assets)
+    finder = _Finder(assets, max_images)
     state = finder.walk(state)
-    questions = {key: {field: finder.walk(value) if field in SEARCHED else value for field, value in question.items()}
-                 for key, question in request["questions"].items()}
+    questions = {}
+    for key, question in request["questions"].items():
+        finder.count = 0
+        questions[key] = {field: finder.walk(value) if field in SEARCHED else value
+                          for field, value in question.items()}
     unused = [key for key in assets if key not in finder.data]
     if unused:
         raise AssetError(f"Asset {unused[0]!r} is not referenced in the state, instructions or criteria")
@@ -109,9 +132,28 @@ def _image_bytes(key: str, asset: dict[str, Any]) -> bytes:
         raise AssetError(f"Asset {key!r}: data_base64 is not base64") from error
 
 
+def places_images(request: Request) -> bool:
+    """Whether ``request`` places images inline (``assets``, or an image part in its state but the screenshot, in its
+    instructions or in its criteria), without placing them."""
+    if request.get(ASSETS):
+        return True
+    state, _ = images_of(request)
+    return _has_part(state) or any(_has_part(question.get(field)) for question in request["questions"].values()
+                                   for field in SEARCHED)
+
+
+def _is_part(value: dict[str, Any]) -> bool:
+    return value.get(TYPE) == IMAGE_URL and isinstance(value.get(IMAGE_URL), dict)
+
+
+def _has_part(value: Any) -> bool:
+    if isinstance(value, dict):
+        return _is_part(value) or any(_has_part(item) for item in value.values())
+    return isinstance(value, list) and any(_has_part(item) for item in value)
+
+
 def _data_url(part: dict[str, Any]) -> str:
-    inner = part.get(IMAGE_URL)
-    url = inner.get("url") if isinstance(inner, dict) else None
+    url = part[IMAGE_URL].get(URL)
     if not (isinstance(url, str) and url.startswith(IMAGE_DATA_URL)):
         raise AssetError("an image part's URL must be a data:image/... URL")
     return url

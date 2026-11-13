@@ -43,10 +43,13 @@ class Pack:
     #: the device and on CPU (the family plans its attention with it); ``seqpos`` then holds the layout's positions.
     segment_ids: torch.Tensor | None = None
     segment_ids_cpu: torch.Tensor | None = None
-    #: Joint layouts only: (3, 1, T) M-RoPE positions, and the images' pixels and grids.
+    #: Joint layouts only: (3, 1, T) M-RoPE positions.
     rope: torch.Tensor | None = None
+    #: The images' pixels: a joint layout's, or Gemma 4's (images, patches, 768) in block layouts.
     pixel_values: torch.Tensor | None = None
+    #: Joint layouts only: the images' grids.
     image_grid_thw: torch.Tensor | None = None
+    image_position_ids: torch.Tensor | None = None  # Gemma 4: (images, patches, 2), the sequences' images in order
     #: Qwen: right-padded segments laid end to end when ``cu_cpu`` is None (one batch row each in the delta rule).
     segments: int = 1
     #: A family's plan of the pack's attention, computed once by its forward pass and reused by every layer (and by
@@ -80,6 +83,7 @@ def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> P
     marker_counts = [len(s.keys) for s in sequences]
     pixels = [s.pixel_values for s in sequences if s.pixel_values is not None]
     grids = [s.image_grid_thw for s in sequences if s.image_grid_thw is not None]
+    places = [s.image_position_ids for s in sequences if s.image_position_ids is not None]
     rope = None if all(blocks) else torch.cat([positions(backbone, s) for s in sequences], dim=1)[:, None, :]
     return Pack(
         input_ids=torch.cat([s.input_ids for s in sequences]).to(device, non_blocking=True),
@@ -95,6 +99,7 @@ def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> P
         rope=None if rope is None else rope.to(device, non_blocking=True),
         pixel_values=torch.cat(pixels).to(device) if pixels else None,
         image_grid_thw=torch.cat(grids).to(device) if grids else None,
+        image_position_ids=torch.cat(places).to(device) if places else None,
     )
 
 

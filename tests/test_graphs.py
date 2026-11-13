@@ -74,3 +74,10 @@ def test_fast_answers_the_warmup_request_before_and_after_capture(monkeypatch, m
     g = decider.model
     assert isinstance(g, graphs.Graphs) and g.model is packed and g.max_tokens == min(graphs.MAX_TOKENS, max_length)
     assert events == [("decide", graphs.WARMUP_REQUEST, packed), "capture", ("decide", graphs.WARMUP_REQUEST, g)]
+
+
+def test_a_pack_with_images_is_not_covered():
+    s = sequence(13, [])
+    with_images = type(s)(**{**s.__dict__, "pixel_values": torch.zeros(1, 4, 3),
+                             "image_position_ids": torch.zeros(1, 4, 2, dtype=torch.long)})
+    assert not graphs.covered(pack([with_images], None, CPU))

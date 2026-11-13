@@ -14,6 +14,9 @@ class FakeDecider:
     def plan(self, request):
         if "long" in request["questions"]:
             raise LengthError("question 'long' needs 9 tokens; the limit is 8")
+        if request.get("images") == ["data:image/png;base64,broken"]:
+            raise OSError("cannot identify image file")
+        self.seen = request
         return ["plan"]
 
 
@@ -61,3 +64,22 @@ def test_a_body_that_is_not_an_object_still_answers_400(post):
     status, body = post([1])
     assert status == 400
     assert "JSON object" in body["error"]["message"]
+
+
+PNG = "data:image/png;base64,iVBORw0KGgo="
+
+
+def test_an_image_request_reaches_the_decider(post):
+    status, body = post({"state": {"viewport_screenshot": {"type": "image_url", "image_url": {"url": PNG}}},
+                         "questions": {"q": QUESTION}, "images": [PNG]})
+    assert status == 200 and FakeRunner.decider.seen["images"] == [PNG]
+
+
+def test_an_image_path_is_refused(post):
+    status, body = post({"state": "", "questions": {"q": QUESTION}, "images": ["/etc/passwd"]})
+    assert status == 400 and "data:image" in body["error"]["message"]
+
+
+def test_an_image_that_does_not_decode_is_a_bad_request(post):
+    status, _ = post({"state": "", "questions": {"q": QUESTION}, "images": ["data:image/png;base64,broken"]})
+    assert status == 400

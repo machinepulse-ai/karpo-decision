@@ -35,8 +35,8 @@ def bucket(length: int, top: int = MAX_TOKENS) -> int | None:
 
 
 def covered(p: Pack, top: int = MAX_TOKENS) -> bool:
-    """One single-block sequence (a request with one question) of at most ``top`` tokens."""
-    return (p.cu_cpu is not None and len(p.cu_cpu) == 2 and p.segment_ids_cpu is not None
+    """One single-block sequence (a request with one question) of at most ``top`` tokens, without images."""
+    return (p.pixel_values is None and p.cu_cpu is not None and len(p.cu_cpu) == 2 and p.segment_ids_cpu is not None
             and not bool(p.segment_ids_cpu.any()) and p.markers.numel() == 1 and p.max_length <= top)
 
 

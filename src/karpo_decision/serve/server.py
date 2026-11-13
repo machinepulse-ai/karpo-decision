@@ -4,19 +4,20 @@
 
 Every rank loads the checkpoint on its own GPU and serves one request at a time. Rank 0 serves ``POST /v1/systemone``
 (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a screenshot as an ``image_url`` part at
-``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no TLS or keys of its own), once every
-replica is up. With ``--nproc_per_node N`` it hands each request to the rank with the fewest in flight, itself
-included; rank r listens on loopback port ``port + r``. The rank that runs a request encodes it: one outside the
-contract gets 400, and one with a question too long for the model gets 422. The ``Server-Timing`` header gives the
-request's encode, share (the hop through rank 0) and model (passes, readout, answers) times in milliseconds. Each
-request is logged by the rank that ran it, as one JSON line without content.
+``state.viewport_screenshot`` and more images at the top-level ``images``, as data URLs) and ``GET /healthz``, on
+loopback by default (no TLS or keys of its own), once every replica is up. With ``--nproc_per_node N`` it hands each
+request to the rank with the fewest in flight, itself included; rank r listens on loopback port ``port + r``. The rank
+that runs a request encodes it: one outside the contract gets 400, and one with a question too long for the model
+gets 422. The ``Server-Timing`` header gives the request's encode, share (the hop through rank 0) and model (passes,
+readout, answers) times in milliseconds. Each request is logged by the rank that ran it, as one JSON line without
+content.
 
-A checkpoint serves through the ``Decider``; the 31B may run its
-decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
-captured at load (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up
-with a text request, since Gemma reads text only (a Qwen3.5 checkpoint reads a screenshot too and warms up with
-one; the 12B and Qwen3.5 checkpoints serve the plain path); ``--triton-attention`` runs the global layers' attention
-in one Triton kernel (sm_120 GPUs). Paths a backbone does not run are refused at startup (``serve.paths``).
+A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
+Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower, ``families/gemma/vision.py``) and Qwen3.5 read
+images, and the 12B reads text only. The 31B alone runs the opt-in paths, which ``serve.paths`` refuses for the others
+at startup: ``--fp8`` runs its decoder projections in FP8 (``serve.fp8``) and replays CUDA graphs captured at load for
+single-question text-only requests (``serve.graphs``, skipped with ``--no-fast`` or the ``blackwell`` extra's
+kernels), and ``--triton-attention`` runs the global layers' attention in one Triton kernel (sm_120 GPUs).
 
 ``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
 131,072 for the 31B).
@@ -93,8 +94,8 @@ def screenshot_request() -> Request:
 
 
 def warmup_request(checkpoint: str) -> Request:
-    """The request that warms a checkpoint up: text only for a block layout (Gemma reads text only), a screenshot for
-    a joint layout (Qwen)."""
+    """The request that warms a checkpoint up: text for a block layout, a screenshot for a joint layout
+    (Qwen)."""
     if template(DecisionConfig.load(checkpoint).template).kind == BLOCKS:
         return graphs.WARMUP_REQUEST
     return screenshot_request()

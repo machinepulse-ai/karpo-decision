@@ -1,9 +1,9 @@
 """Gemma 4 (``google/gemma-4-31B-it``), trained the way the
-board's top Gemma entries are (Sieve-31B-v3): text only (the vision tower is loaded and frozen, requests with images
-are refused), the tokenizer as the processor, block layouts only (``karpo-blocks-v1``: the answer is read at the
-``Answer: (`` slot ending each branch, as the model's own next-token logits of the option labels, with the soft cap of
-its tied language-model head, ``final_logit_softcapping`` 30). Only the decoder's linear projections train: the token
-embeddings (tied with the head), every norm and the readout stay as pretrained.
+board's top Gemma entries are (Sieve-31B-v3): images through the backbone's pretrained vision tower (``vision.py``;
+loaded and frozen), the tokenizer as the processor, block layouts only (``karpo-blocks-v1``: the answer is read at
+the ``Answer: (`` slot ending each branch, as the model's own next-token logits of the option labels, with the soft
+cap of its tied language-model head, ``final_logit_softcapping`` 30). Only the decoder's linear projections train: the
+token embeddings (tied with the head), every norm and the readout stay as pretrained.
 In a bidirectional model the global layers see what a token may see in both directions and the sliding-window layers
 stay causal inside their window (``packed.py``). ``MARKER`` only satisfies the encoder's check and is escaped from
 request text; block layouts place no marker token. The 12B (``google/gemma-4-12B-it``, ``gemma4_unified``) has the
@@ -11,6 +11,7 @@ same text layers and no vision tower (images go through an embedder), and loads 
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4Uni
 
 from .. import model_type
 from .packed import Packed
+from .vision import ImageTokens, Vision
 
 MODEL_TYPE = "gemma4"
 MARKER = "<mask>"
@@ -30,15 +32,17 @@ TRAINED = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down
 #: The backbone class of each ``model_type`` the family reads.
 BACKBONES = {"gemma4": Gemma4Model, "gemma4_unified": Gemma4UnifiedModel}
 
-__all__ = ["MARKER", "MODEL_TYPE", "TEMPLATES", "Packed", "TextProcessor", "load_backbone", "load_processor",
-           "logit_cap"]
+__all__ = ["MARKER", "MODEL_TYPE", "TEMPLATES", "Packed", "Processor", "load_backbone", "load_processor",
+           "logit_cap", "vision_of"]
 
 
-class TextProcessor:
-    """The tokenizer in the processor's place: chat template, tokenization of text alone, saving."""
+class Processor:
+    """The tokenizer in the processor's place (chat template, tokenization of text alone, saving), and ``vision`` for a
+    backbone with a vision tower (None: the checkpoint reads text only)."""
 
-    def __init__(self, tokenizer: Any) -> None:
+    def __init__(self, tokenizer: Any, vision: Vision | None = None) -> None:
         self.tokenizer = tokenizer
+        self.vision = vision
 
     def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any:
         return self.tokenizer.apply_chat_template(*args, **kwargs)
@@ -47,17 +51,29 @@ class TextProcessor:
         self.tokenizer.save_pretrained(directory)
 
     def __call__(self, text: list[str], images: Any = None, return_tensors: str | None = None, **_: Any) -> Any:
-        """Text alone, as the processor would tokenize it (the chat template already wrote ``<bos>``)."""
+        """Text alone, as the processor would tokenize it (the chat template already wrote ``<bos>``); images go
+        through ``vision``."""
         if images:
-            raise ValueError("the Gemma family reads text only")
+            raise ValueError("images go through Processor.vision, not the tokenizer")
         ids = self.tokenizer(text, add_special_tokens=False, return_tensors=return_tensors)["input_ids"]
         return {"input_ids": ids, "mm_token_type_ids": torch.zeros_like(ids)}
 
 
-def load_processor(directory: str | Path, max_pixels: int) -> TextProcessor:
+def vision_of(directory: Path) -> Vision | None:
+    """``Vision`` when ``directory``'s ``config.json`` is a Gemma 4 with a vision tower, else None."""
+    path = Path(directory) / "config.json"
+    if not path.exists():
+        return None
+    config = json.loads(path.read_text())
+    if config.get("model_type") != MODEL_TYPE or not config.get("vision_config"):
+        return None
+    return Vision(ImageTokens(config["boi_token_id"], config["image_token_id"], config["eoi_token_id"]))
+
+
+def load_processor(directory: str | Path, max_pixels: int) -> Processor:
     tokenizer = AutoTokenizer.from_pretrained(str(directory))
     tokenizer.padding_side = "left"
-    return TextProcessor(tokenizer)
+    return Processor(tokenizer, vision_of(Path(directory)))
 
 
 def load_backbone(weights: str | Path, dtype: torch.dtype) -> Gemma4Model | Gemma4UnifiedModel:

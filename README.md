@@ -83,18 +83,19 @@ docker run --gpus all -v <checkpoint dir>:/checkpoint -p 18440:18440 karpo-decis
 
 ### Opt-in paths by checkpoint
 
-Same top answer as the plain path, and latency per request (median / mean), one request at a time on one GPU, over
-2,215 Decision Index requests:
+Same top answer as the plain path, and latency per request once the kernels are compiled (median / mean), one request
+at a time on one GPU, over 2,215 Decision Index requests:
 
 | Checkpoint | Plain | `--graphs` | `--fp8` | `--fp8 --graphs` | `--triton-attention` |
 |---|---|---|---|---|---|
-| 12B | 55 / 213 ms | | 99.1%, 49 / 161 ms | 99.1%, 30 / 146 ms | 99.8%, 47 / 185 ms |
-| 9B | 70 / 144 ms | 99.9%, 31 / 147 ms | 99.6%, 76 / 314 ms | 99.5%, 21 / 104 ms | |
-| 4B | 53 / 189 ms | 99.9%, 19 / 101 ms | 99.5%, 76 / 272 ms | 99.5%, 14 / 77 ms | |
-| 2B | 43 / 64 ms | 99.9%, 11 / 54 ms | 99.2%, 60 / 197 ms | 99.3%, 9 / 46 ms | |
-| 0.8B | 41 / 138 ms | 99.9%, 8 / 44 ms | 99.0%, 66 / 193 ms | 99.0%, 8 / 42 ms | |
+| 31B | 114 / 510 ms | 100.0%, 114 / 509 ms | 99.4%, 82 / 367 ms | 99.4%, 77 / 354 ms | 99.8%, 114 / 460 ms |
+| 12B | 57 / 214 ms | 99.9%, 46 / 204 ms | 99.1%, 61 / 166 ms | 99.1%, 31 / 147 ms | 99.9%, 54 / 190 ms |
+| 9B | 71 / 155 ms | 99.9%, 31 / 130 ms | 99.6%, 106 / 192 ms | 99.5%, 21 / 93 ms | |
+| 4B | 72 / 123 ms | 99.9%, 19 / 87 ms | 99.5%, 108 / 166 ms | 99.5%, 14 / 68 ms | |
+| 2B | 52 / 72 ms | 99.9%, 11 / 41 ms | 99.2%, 82 / 105 ms | 99.3%, 9 / 34 ms | |
+| 0.8B | 53 / 65 ms | 99.9%, 8 / 31 ms | 99.1%, 79 / 93 ms | 99.0%, 8 / 27 ms | |
 
-Capturing the graphs takes 2-4 minutes at startup.
+Capturing the graphs takes 2-7 minutes at startup.
 
 ## Decision Index
 

@@ -2,13 +2,17 @@
 
     torchrun --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint path/to/checkpoint --port 18440
 
-Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a
-screenshot as an ``image_url`` part at ``state.viewport_screenshot`` and more images at the top-level ``images``, as
-data URLs) and ``GET /healthz``, on loopback by default (no TLS or keys of its own). Rank 0 encodes each request, so one
-outside the contract gets 400, and one with a question too long for the model gets 422, without reaching the other
-ranks; it hands the encoded sequences to them over a CPU (gloo) group, and every rank runs the same passes, one request
-at a time. The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout,
-answers) times in milliseconds. Each request is logged as one JSON line without content.
+Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out) and
+``GET /healthz``, on loopback by default (no TLS or keys of its own). Images come as TypeSafe's System One sends them
+(``assets`` referenced from the state, instructions or criteria, as base64 or as the parts of a multipart/form-data
+body after its ``request`` JSON part), as ``image_url`` parts with data URLs anywhere in those, or as the legacy
+screenshot at ``state.viewport_screenshot`` and ``images`` (data URLs). A body may be compressed with one
+Content-Encoding (gzip, x-gzip or zstd) and is at most ``MAX_BODY_BYTES`` compressed and decompressed (413; another
+encoding 415). Rank 0 encodes each request, so one outside the contract or with a question too long for the model gets
+422, and a body, image or asset it cannot read gets 400, without reaching the other ranks; it hands the encoded
+sequences to them over a CPU (gloo) group, and every rank runs the same passes, one request at a time. The
+``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers) times
+in milliseconds. Each request is logged as one JSON line without content.
 
 A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, warmed up with a text request for a
 block layout and a screenshot for a Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
@@ -45,21 +49,23 @@ from urllib.parse import urlsplit
 import torch
 import torch.distributed as dist
 
+from ..assets import AssetError
 from ..config import DecisionConfig
 from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..families.qwen import MODEL_TYPE as QWEN
-from ..protocol import IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
+from ..protocol import ASSETS, IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
 from ..templates import BLOCKS, template
-from . import graphs, qwen_fp8, qwen_graphs
+from . import graphs, qwen_fp8, qwen_graphs, wire
 from .fp8 import quantize
 from .paths import GRAPHS, backbone_type, path_name, require
 
 #: ``graphs`` is also an option of ``load_decider``, which would hide the module there.
 gemma_graphs = graphs
 
-MAX_BODY_BYTES = 4 * 1024 * 1024
+#: The largest body, compressed and decompressed (TypeSafe's limit).
+MAX_BODY_BYTES = 32 * 1024 * 1024
 #: The screenshot warm-up: a blank page as a JPEG data URL in the state, with one question.
 SCREENSHOT_WARMUP_SIZE = (768, 480)
 SCREENSHOT_WARMUP_GREY = (200, 200, 200)
@@ -141,10 +147,10 @@ def scrub(node: Any) -> Any:
 
 
 def check_images(request: Request) -> None:
-    """Images come inline, a data URL each: a path would read the server's own files."""
+    """Legacy images come inline, a data URL each: a path would read the server's own files."""
     for image in images_of(request)[1]:
         if not (isinstance(image, str) and image.startswith(IMAGE_DATA_URL)):
-            raise RequestError("an image must be a data:image/... URL")
+            raise AssetError("an image must be a data:image/... URL")
 
 
 class Ranks:
@@ -231,18 +237,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(413, f"body is larger than {MAX_BODY_BYTES} bytes", close=True)
         decider = self.server.ranks.decider
         try:
-            body = scrub(json.loads(self.rfile.read(int(length))))
+            raw = wire.inflate(self.rfile.read(int(length)), self.headers.get(wire.CONTENT_ENCODING), MAX_BODY_BYTES)
+            content_type = self.headers.get(wire.CONTENT_TYPE, "")
+            parts: dict[str, bytes] = {}
+            if content_type.split(";")[0].strip().lower() == wire.MULTIPART:
+                raw, parts = wire.parse_multipart(raw, content_type)
+            body = scrub(json.loads(raw))
             if not isinstance(body, dict):
                 raise RequestError("the body must be a JSON object")
+            body = wire.claim(body, parts)
             request: Request = {"state": body.get("state", ""), "questions": body.get("questions")}
             if body.get("images"):
                 request["images"] = body["images"]
+            if body.get(ASSETS) is not None:
+                request[ASSETS] = body[ASSETS]
             encoding = time.perf_counter()
             check_images(request)
             plan = decider.plan(request)
-        except LengthError as error:  # a question that does not fit: the model declines it
+        except wire.TooLarge as error:
+            return self._error(413, str(error))
+        except wire.UnsupportedEncoding as error:
+            return self._error(415, str(error))
+        except (RequestError, LengthError) as error:  # outside the contract, or a question that does not fit
             return self._error(422, str(error))
-        except (ValueError, OSError) as error:  # json, the contract, an image that does not decode
+        except (ValueError, OSError) as error:  # the body, an image or an asset it cannot read
             return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - answer instead of dropping the connection
             log(event="request", status=500, error=type(error).__name__, stage="encode")

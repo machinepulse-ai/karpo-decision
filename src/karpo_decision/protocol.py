@@ -1,6 +1,7 @@
 """The System One request contract: a state and typed questions about it.
 
-A request is ``{"state": <text or JSON>, "questions": {<id>: <question>, ...}, "images": [...]}`` (images optional).
+A request is ``{"state": <text or JSON>, "questions": {<id>: <question>, ...}, "images": [...], "assets": {...}}``
+(images and assets optional).
 A question is one of:
 
 - ``{"type": "choice", "instructions": ..., "criteria": {<option key>: <description or None>, ...}}``
@@ -9,7 +10,8 @@ A question is one of:
 
 A caller may put a page screenshot in the state at ``VIEWPORT_SCREENSHOT``, as an OpenAI-style image part
 ``{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}``; ``images_of`` lifts it out so the model
-reads it as an image rather than as text. Nothing here needs a GPU.
+reads it as an image rather than as text. Images may also sit anywhere in the state, a question's instructions or its
+criteria, as such parts or as the keys of ``assets`` (TypeSafe's System One; ``assets.py``). Nothing here needs a GPU.
 """
 
 from __future__ import annotations
@@ -21,10 +23,19 @@ from typing import Any, Literal, NotRequired, TypedDict
 MAX_OPTIONS = 255
 #: Where a request may carry the page screenshot (a data URL) inside the state.
 VIEWPORT_SCREENSHOT = "viewport_screenshot"
-#: The type of an OpenAI-style image part.
+#: The type of an OpenAI-style image part, and its field holding ``{URL: ...}``.
 IMAGE_URL = "image_url"
+URL = "url"
 #: How an inline image's URL starts.
 IMAGE_DATA_URL = "data:image/"
+#: The top-level map of a request's images by the key its text references them with (TypeSafe's System One).
+ASSETS = "assets"
+#: An asset's fields: its type (``IMAGE_ASSET``, or absent), and its image as base64 text with its format, as raw bytes
+#: (Python callers; the server puts each multipart part here), or as the name of a multipart part.
+TYPE, IMAGE_ASSET = "type", "image"
+DATA_BASE64, FORMAT, DATA, PART = "data_base64", "format", "data", "part"
+#: The formats an asset with ``data_base64`` may name; the image's own bytes decide how it is read.
+FORMATS = ("png", "jpg", "jpeg")
 #: What a noul question's two options say when its criteria do not describe them.
 NOUL_KEYS = ("false", "true")
 NOUL_DEFAULTS = ("No / false", "Yes / true")
@@ -44,6 +55,7 @@ class Request(TypedDict):
     state: JSONValue
     questions: dict[str, Question]
     images: NotRequired[list[Any]]
+    assets: NotRequired[dict[str, Any]]
 
 
 class RequestError(ValueError):
@@ -93,6 +105,28 @@ def validate(request: Request, max_options: int = MAX_OPTIONS) -> None:
             raise RequestError(f"Question {key!r}: {count} options; 1 to {max_options} are supported")
         if kind == "score" and count < 2:
             raise RequestError(f"Question {key!r}: a score needs at least two levels")
+    if request.get(ASSETS) is not None:
+        validate_assets(request[ASSETS])
+
+
+def validate_assets(assets: Any) -> None:
+    """Raise ``RequestError`` unless ``assets`` is a nonempty map of keys to image assets, each with ``part``, with
+    ``data`` bytes, or with ``data_base64`` text and one of ``FORMATS``."""
+    if not isinstance(assets, dict) or not assets:
+        raise RequestError("'assets' must be a nonempty object")
+    for key, asset in assets.items():
+        if not isinstance(key, str) or not key:
+            raise RequestError("Asset keys must be nonempty strings")
+        if not isinstance(asset, dict) or asset.get(TYPE) not in (None, IMAGE_ASSET):
+            raise RequestError(f"Asset {key!r}: must be an object of type {IMAGE_ASSET!r}")
+        if asset.get(PART) is not None:
+            if not isinstance(asset[PART], str):
+                raise RequestError(f"Asset {key!r}: 'part' must name a multipart part")
+        elif not isinstance(asset.get(DATA), bytes):
+            if not isinstance(asset.get(DATA_BASE64), str):
+                raise RequestError(f"Asset {key!r}: needs 'data_base64' ('part' in a multipart request)")
+            if asset.get(FORMAT) not in FORMATS:
+                raise RequestError(f"Asset {key!r}: 'format' must be one of {', '.join(FORMATS)}")
 
 
 def image_source(value: Any) -> Any:
@@ -103,9 +137,17 @@ def image_source(value: Any) -> Any:
 
 
 def images_of(request: Request) -> tuple[JSONValue, list[Any]]:
-    """The state without its screenshot, and every image of the request (the screenshot first)."""
+    """The state without its screenshot, and every image of the request (the screenshot first). A screenshot that
+    references an asset (a string holding an asset key) stays in the state, an inline image there (``assets.py``)."""
     state, images = request["state"], [image_source(value) for value in request.get("images") or []]
-    if isinstance(state, dict) and state.get(VIEWPORT_SCREENSHOT):
-        images.insert(0, image_source(state[VIEWPORT_SCREENSHOT]))
+    shot = state.get(VIEWPORT_SCREENSHOT) if isinstance(state, dict) else None
+    if shot and not references(shot, request.get(ASSETS)):
+        images.insert(0, image_source(shot))
         state = {key: value for key, value in state.items() if key != VIEWPORT_SCREENSHOT}
     return state, images
+
+
+def references(value: Any, assets: Any) -> bool:
+    """Whether ``value`` is a string holding a key of ``assets``."""
+    return isinstance(value, str) and isinstance(assets, dict) and any(
+        isinstance(key, str) and key and key in value for key in assets)

@@ -15,6 +15,7 @@ dependencies = [
     "transformers>=5.17",   # Gemma 4 (gemma4, gemma4_unified) and Qwen3.5 (qwen3_5) backbones
     "safetensors>=0.6",
     "pillow>=11",           # images: encoding.open_image, Gemma 4's image processor
+    "backports.zstd>=1.0; python_version < '3.14'",  # zstd request bodies (serve.wire), standard from Python 3.14
 ]
 
 [project.optional-dependencies]
@@ -24,7 +25,7 @@ qwen = ["flash-linear-attention>=0.5.2", "torchvision>=0.29"]
 # (sliding layers, head size 256, its generic d256 backward); without them the memory-efficient / FA2 paths serve.
 blackwell = ["nvidia-cudnn-frontend==1.32.1", "nvidia-cutlass-dsl==4.8.1", "apache-tvm-ffi==0.1.15.post2",
              "flash-attn-4==4.0.0b37", "quack-kernels==0.6.5", "torch-c-dlpack-ext==0.1.5", "einops>=0.8"]
-dev = ["pytest>=8", "ruff>=0.8"]
+dev = ["pytest>=8", "ruff>=0.8", "typesafe-sdk[zstd]>=0.7.5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/karpo_decision"]

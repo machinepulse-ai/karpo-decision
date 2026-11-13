@@ -85,6 +85,15 @@ def test_summary_gives_pixels_per_image_and_soft_tokens():
     assert pixels == (valid * 16 * 16).tolist() and tokens == sum(images.tokens)
 
 
+def test_open_image_reads_image_file_bytes():
+    buffer = io.BytesIO()
+    Image.new("RGB", (20, 10), (1, 2, 3)).save(buffer, format="PNG")
+    image = open_image(buffer.getvalue())
+    assert image.size == (20, 10) and image.getpixel((0, 0)) == (1, 2, 3)
+    with pytest.raises((ValueError, OSError)):
+        open_image(b"not an image")
+
+
 def test_a_data_url_that_is_not_an_image_is_refused():
     bad = "data:image/png;base64," + base64.b64encode(b"not an image").decode()
     with pytest.raises((ValueError, OSError)):

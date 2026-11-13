@@ -61,13 +61,16 @@ class Encoded:
 
 
 def open_image(value: Any) -> Any:
-    """A PIL image from a data URL, a file path or an image; ValueError or OSError when it does not decode (PIL's
-    decompression bomb error is neither, so it becomes a ValueError)."""
+    """A PIL image from image file bytes, a data URL, a file path or an image; ValueError or OSError when it does not
+    decode (PIL's decompression bomb error is neither, so it becomes a ValueError)."""
     from PIL import Image
 
     if isinstance(value, Image.Image):
         return value.convert("RGB")
     try:
+        if isinstance(value, bytes):
+            with Image.open(io.BytesIO(value)) as image:
+                return image.convert("RGB")
         if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
             with Image.open(io.BytesIO(base64.b64decode(value.partition(",")[2], validate=True))) as image:
                 return image.convert("RGB")

@@ -1,4 +1,4 @@
-"""POST /v1/systemone over real HTTP on CPU: status codes and usage keys. The runner and the decider are fakes."""
+"""POST /v1/systemone over real HTTP on CPU: status codes and usage keys. The ranks and the decider are fakes."""
 
 import http.client
 import json
@@ -20,16 +20,16 @@ class FakeDecider:
         return ["plan"]
 
 
-class FakeRunner:
+class FakeRanks:
     decider = FakeDecider()
 
     def run(self, questions, plan):
-        return {"answers": {key: {"answer": "A"} for key in questions}, "usage": {"input_tokens": 7}}
+        return {"answers": {key: {"answer": "A"} for key in questions}, "usage": {"input_tokens": 7}}, 0.0
 
 
 @pytest.fixture
 def post():
-    httpd = server.Server(("127.0.0.1", 0), FakeRunner(), "test", {})
+    httpd = server.Server(("127.0.0.1", 0), FakeRanks(), "test", {})
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     def send(body):
@@ -72,7 +72,7 @@ PNG = "data:image/png;base64,iVBORw0KGgo="
 def test_an_image_request_reaches_the_decider(post):
     status, body = post({"state": {"viewport_screenshot": {"type": "image_url", "image_url": {"url": PNG}}},
                          "questions": {"q": QUESTION}, "images": [PNG]})
-    assert status == 200 and FakeRunner.decider.seen["images"] == [PNG]
+    assert status == 200 and FakeRanks.decider.seen["images"] == [PNG]
 
 
 def test_an_image_path_is_refused(post):

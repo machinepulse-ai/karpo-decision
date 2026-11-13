@@ -383,7 +383,7 @@ def main() -> None:
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
-    dist.init_process_group("nccl", device_id=device)
+    dist.init_process_group(CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
     rank, world = dist.get_rank(), dist.get_world_size()
     # One channel per other rank; every rank creates all of them, in the same order.
     groups = [dist.new_group([0, other], backend=CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
@@ -414,7 +414,7 @@ def main() -> None:
     server.shutdown()
     server.server_close()
     ranks.stop()
-    # The process just ends, without tearing the NCCL group down.
+    # The process just ends, without tearing the process group down.
     os._exit(0)
 
 

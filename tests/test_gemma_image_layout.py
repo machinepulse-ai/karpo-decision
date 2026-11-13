@@ -1,7 +1,7 @@
 """Where ``blocks.py`` puts a request's images, with the 31B's tokenizer (``KARPO_GEMMA_TOKENIZER``: a directory with
 its tokenizer, ``config.json`` and ``decision_config.json``; skipped without it): in the shared block after the context
 header and before the state text, ``Image k:`` before each when there are several; once per request; repeated in every
-part of a split request; counted in its length."""
+part of a split request; counted in its length, the request failing at the first image past it."""
 
 import os
 
@@ -96,6 +96,23 @@ def test_images_count_in_the_length(encoder):
     (part,) = encoder.plan(request, None)
     with pytest.raises(LengthError):
         encoder.plan(request, part.length - 1)
+
+
+def test_images_past_the_limit_fail_before_the_rest_are_read(encoder, monkeypatch):
+    """Even a tiny image is scaled up to the processor's budget: images are prepared one at a time, and the first whose
+    tokens alone pass ``max_length`` fails the request."""
+    n = encoder.processor.vision.prepare([picture()]).tokens[0]
+    prepared, prepare = [], gemma.vision.Vision.prepare
+
+    def counted(self, values):
+        prepared.extend(values)
+        return prepare(self, values)
+
+    monkeypatch.setattr(gemma.vision.Vision, "prepare", counted)
+    request = {"state": STATE, "questions": {"q": QUESTION}, "images": [picture()] * 40}
+    with pytest.raises(LengthError, match="images need"):
+        encoder.plan(request, 2 * n)  # one image with its markers fits, the second passes the limit
+    assert len(prepared) == 2
 
 
 def test_text_requests_lay_out_as_before(encoder):

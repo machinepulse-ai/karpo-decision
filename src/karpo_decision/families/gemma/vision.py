@@ -18,6 +18,7 @@ from ...encoding import open_image
 #: Soft tokens per image at most (Gemma 4's processor takes 70, 140, 280, 560 or 1120): 5,040 patches of 16 x 16
 #: pixels pooled 3 x 3, about 1.29 MP.
 MAX_SOFT_TOKENS = 560
+PADDING = -1  # position id of a padding patch
 
 
 @dataclass(frozen=True)
@@ -48,13 +49,19 @@ class Vision:
         self.processor = Gemma4ImageProcessorPil(max_soft_tokens=max_soft_tokens)
 
     def _valid(self, position_ids: torch.Tensor) -> torch.Tensor:
-        return (position_ids != -1).all(-1).sum(-1)
+        return (position_ids != PADDING).all(-1).sum(-1)
 
     def prepare(self, values: Sequence[Any]) -> Images:
         """``values``: PIL images, data URLs or file paths (``encoding.open_image``)."""
         out = self.processor(images=[open_image(value) for value in values], return_tensors="pt")
         pooled = self._valid(out["image_position_ids"]) // self.processor.pooling_kernel_size ** 2
         return Images(out["pixel_values"], out["image_position_ids"], tuple(int(n) for n in pooled))
+
+    @staticmethod
+    def join(parts: Sequence[Images]) -> Images:
+        """Images prepared apart as one, in order (the processor pads every image to the same patch count)."""
+        return Images(torch.cat([p.pixel_values for p in parts]), torch.cat([p.position_ids for p in parts]),
+                      tuple(n for p in parts for n in p.tokens))
 
     def summary(self, position_ids: torch.Tensor) -> tuple[list[int], int]:
         """Each image's pixels as the vision tower reads them, and the soft tokens of them all."""
@@ -85,7 +92,8 @@ class ImagePlan:
 def plan_images(input_ids: torch.Tensor, bounds: list[int], soft: int, window: int,
                 device: torch.device) -> ImagePlan:
     """``input_ids`` on CPU; ``bounds`` the pack's sequence boundaries; ``window`` the sliding layers' (a token and the
-    window - 1 before it). An image's soft tokens are one run (the layout puts ``begin`` and ``end`` around them)."""
+    window - 1 before it). An image's soft tokens are one run (the layout puts ``begin`` and ``end`` around them).
+    Images sit in the shared block at the start of their sequence, so the key range never reaches a branch."""
     rows = (input_ids == soft).nonzero().flatten()
     if rows.numel() == 0:
         raise ValueError("a pack with images has no image soft tokens")

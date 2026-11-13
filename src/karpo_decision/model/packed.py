@@ -43,9 +43,11 @@ class Pack:
     #: the device and on CPU (the family plans its attention with it); ``seqpos`` then holds the layout's positions.
     segment_ids: torch.Tensor | None = None
     segment_ids_cpu: torch.Tensor | None = None
-    #: Joint layouts only: (3, 1, T) M-RoPE positions, and the images' pixels and grids.
+    #: Joint layouts only: (3, 1, T) M-RoPE positions.
     rope: torch.Tensor | None = None
+    #: The images' pixels: a joint layout's, or Gemma 4's (images, patches, 768) in block layouts.
     pixel_values: torch.Tensor | None = None
+    #: Joint layouts only: the images' grids.
     image_grid_thw: torch.Tensor | None = None
     image_position_ids: torch.Tensor | None = None  # Gemma 4: (images, patches, 2), the sequences' images in order
     #: Qwen: right-padded segments laid end to end when ``cu_cpu`` is None (one batch row each in the delta rule).

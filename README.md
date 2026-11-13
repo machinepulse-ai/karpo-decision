@@ -52,7 +52,7 @@ print(response["answers"])
 
 The 31B and the Qwen3.5 checkpoints also read a screenshot at `state.viewport_screenshot`, as an `image_url` part
 with a `data:image/...` URL. The 31B reads more images at `images` (data URLs; in Python also PIL images or file
-paths), each at most 560 tokens of `--max-length`.
+paths); each image takes up to 560 tokens of `--max-length` plus a few markers.
 
 ## Serving
 
@@ -109,7 +109,8 @@ src/karpo_decision/
 
 ```bash
 uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
-.venv/bin/python -m pytest -q          # GPU, Gemma-base and KARPO_TOKENIZER (Qwen3.5) tests skip without them
+.venv/bin/python -m pytest -q          # GPU, Gemma-base, KARPO_TOKENIZER (Qwen3.5) and KARPO_GEMMA_TOKENIZER (a
+                                       # directory with the 31B's tokenizer and configs) tests skip without them
 .venv/bin/ruff check src tests
 ```
 

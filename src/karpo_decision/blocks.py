@@ -74,6 +74,22 @@ class BlockLayout:
             ids += [marks.begin, *[marks.soft] * n, marks.end, *self.newline]
         return ids
 
+    def prepare_images(self, vision: Any, values: list[Any], max_length: int | None) -> Any:
+        """``values`` prepared one at a time (``vision.prepare``): the processor scales even a tiny image up to its
+        budget, so the request fails (``LengthError``) at the first image that takes the images' part of the shared
+        block past ``max_length``, before the next is read."""
+        from .encoding import LengthError
+
+        parts, need = [], 0
+        for k, value in enumerate(values, start=1):
+            parts.append(vision.prepare([value]))
+            need += len(self.image_ids(parts[-1]))  # one image: no label
+            if len(values) > 1:
+                need += len(self.tokenize(IMAGE_LABEL.format(k)))
+            if max_length and need > max_length:
+                raise LengthError(f"the request's images need {need} tokens; the limit is {max_length}")
+        return vision.join(parts)
+
     def shared(self, state: Any, questions: Sequence[Question], images: Any = None) -> list[int]:
         ids = self.prefix + self.header
         for question in questions:
@@ -96,7 +112,7 @@ class BlockLayout:
             vision = getattr(self.encoder.processor, "vision", None)
             if vision is None:
                 raise TextOnlyError("this checkpoint reads text only")
-            images = vision.prepare(values)
+            images = self.prepare_images(vision, values, max_length)
         items = list(request["questions"].items())
         shared = self.shared(state, [q for _, q in items], images)
         branches = [(key, len(options(q)[0]), self.branch(q)) for key, q in items]

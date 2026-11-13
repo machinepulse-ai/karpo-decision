@@ -7,14 +7,18 @@ process, one request at a time, and what the leaderboard's maintainers time.
 Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or ``reversed``: ``karpo_decision.views``);
 ``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false, the 31B only:
 the decoder projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with
-``fp8``, single-question requests replay CUDA graphs captured at load, ``serve.graphs``; not with the ``blackwell``
-extra's kernels); ``triton_attention`` (default false, the 31B only: the global layers' attention in one Triton kernel,
-sm_120 GPUs, bidirectional checkpoints and a ``max_length`` under 131,072 only, ``families.gemma.triton_attention``;
-answers move by bf16 noise). A path the checkpoint's backbone does not run is refused before loading
-(``serve.paths``). A request outside the contract, or with a question that does not fit ``max_length`` tokens with its
-state, is ``Unsupported``. ``image_root`` (default none): the directory the kit's image references are relative to,
-read with the kit's loader and its pixel cap. A request with images (the vision suite) runs through the backbone's
-vision tower (``families/gemma/vision.py``); its row reports the images' pixels and soft tokens.
+``fp8``, single-question text-only requests replay CUDA graphs captured at load, ``serve.graphs``; not with the
+``blackwell`` extra's kernels); ``triton_attention`` (default false, the 31B only: the global layers' attention in one
+Triton kernel, sm_120 GPUs, bidirectional checkpoints and a ``max_length`` under 131,072 only,
+``families.gemma.triton_attention``; answers move by bf16 noise); ``image_root`` (default none: the directory the kit's
+image references are relative to, read with the kit's loader and its pixel cap). A path the checkpoint's backbone does
+not run is refused before loading (``serve.paths``).
+
+A request outside the contract, with an image that cannot be read, or with a question that does not fit ``max_length``
+tokens with its state and images is ``Unsupported``, and so is a request with images on the 12B, which reads text only.
+On the 31B a request with images (the vision suite) runs through the backbone's vision tower
+(``families/gemma/vision.py``) and its meta reports the images' pixels and soft tokens; a checkpoint without that Gemma
+vision unit returns meta None (Qwen3.5 reads images through its own layout).
 """
 
 from __future__ import annotations
@@ -40,7 +44,8 @@ from .paths import FP8, GRAPHS, TRITON_ATTENTION, require
 class DecisionIndexEngine(Engine):
     name = "karpo-decision"
     latency = ("Device-synchronized in-process request wall time: prompt, tokenization and plan, the forward passes, "
-               "readout and answers; excludes loading, graph capture and warmup.")
+               "readout and answers (with images, also reading them and the vision tower); excludes loading, graph "
+               "capture and warmup.")
 
     def __init__(self, checkpoint: str, view: str = "joint", max_length: int = DEFAULT_MAX_LENGTH,
                  device: str = "cuda", fp8: bool = False, fast: bool = True, triton_attention: bool = False,

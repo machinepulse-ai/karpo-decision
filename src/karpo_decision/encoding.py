@@ -43,7 +43,8 @@ class Encoded:
     markers: torch.Tensor  # readout positions, one per question
     #: Joint layouts with images: which tokens are image tokens (1) and which text (0).
     mm_token_type_ids: torch.Tensor | None = None
-    #: Joint layouts with images: the processor's pixel values of every image.
+    #: With images, the processor's pixel values of every image: a joint layout's, or Gemma 4's (images, patches, 768)
+    #: in a block layout.
     pixel_values: torch.Tensor | None = None
     #: Joint layouts with images: each image's (t, h, w) grid of patches.
     image_grid_thw: torch.Tensor | None = None
@@ -60,16 +61,20 @@ class Encoded:
 
 
 def open_image(value: Any) -> Any:
-    """A PIL image from a data URL, a file path or an image."""
+    """A PIL image from a data URL, a file path or an image; ValueError or OSError when it does not decode (PIL's
+    decompression bomb error is neither, so it becomes a ValueError)."""
     from PIL import Image
 
     if isinstance(value, Image.Image):
         return value.convert("RGB")
-    if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
-        with Image.open(io.BytesIO(base64.b64decode(value.split(",", 1)[1], validate=True))) as image:
+    try:
+        if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
+            with Image.open(io.BytesIO(base64.b64decode(value.partition(",")[2], validate=True))) as image:
+                return image.convert("RGB")
+        with Image.open(value) as image:
             return image.convert("RGB")
-    with Image.open(value) as image:
-        return image.convert("RGB")
+    except Image.DecompressionBombError as error:
+        raise ValueError(str(error)) from error
 
 
 class Encoder:

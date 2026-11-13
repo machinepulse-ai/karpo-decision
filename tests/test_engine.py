@@ -10,6 +10,7 @@ import types
 import pytest
 
 pytest.importorskip("decision_index")
+from karpo_decision.encoding import TextOnlyError  # noqa: E402
 from karpo_decision.serve import engine  # noqa: E402
 
 
@@ -133,3 +134,23 @@ def test_engine_answers_unsupported_for_an_image_it_cannot_read(monkeypatch):
     e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
     with pytest.raises(engine.Unsupported):
         e({}, {"q": {"type": "noul", "instructions": "Blank?"}}, images=["broken"])
+
+
+def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(monkeypatch):
+    """The 12B (``vision`` None): its plan refuses images with ``TextOnlyError``."""
+    loaded = decider()
+
+    def plan(request):
+        if request.get("images"):
+            raise TextOnlyError("this checkpoint reads text only")
+        return [types.SimpleNamespace(image_position_ids=None)]
+
+    loaded.plan = plan
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset())
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    images_module = types.SimpleNamespace(MAX_PIXELS=1_638_400, pil=lambda ref, root, cap: ref)
+    monkeypatch.setitem(sys.modules, "decision_index.vision.images", images_module)
+    monkeypatch.setitem(sys.modules, "decision_index.vision", types.SimpleNamespace(images=images_module))
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
+    with pytest.raises(engine.Unsupported, match="TextOnlyError"):
+        e({}, {"q": {"type": "noul", "instructions": "Blank?"}}, images=["img/0.jpg"])

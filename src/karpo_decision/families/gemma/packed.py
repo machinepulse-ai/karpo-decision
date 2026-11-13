@@ -308,8 +308,8 @@ class Packed(PackedLayers):
         p.plan = block_plan(p, self.window)
         if p.pixel_values is not None:
             if self.causal_global:
-                raise ValueError("images need a bidirectional checkpoint: a causal global layer would not let a soft "
-                                 "token see the rest of its image")
+                raise ValueError("images are supported on bidirectional checkpoints only, the ones the image path was "
+                                 "validated on")
             p.plan.images = vision.plan_images(p.input_ids.cpu(), p.cu_cpu.tolist(),
                                                self.backbone.config.image_token_id, self.window, p.input_ids.device)
         h = self.embed(p.input_ids)

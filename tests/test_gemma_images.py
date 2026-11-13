@@ -130,7 +130,7 @@ def test_the_images_change_the_answer(backbone, cpu_kernels):
 
 
 def test_images_need_a_bidirectional_checkpoint(backbone, cpu_kernels):
-    """A causal checkpoint's global layers would not let a soft token see the rest of its image."""
+    """Images are supported on bidirectional checkpoints only, the ones the image path was validated on."""
     with pytest.raises(ValueError, match="bidirectional"):
         gp.Packed(backbone, "causal")(pack([sequence(6, images(picture(12)), 4)], None, CPU))
 

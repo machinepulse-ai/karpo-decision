@@ -20,7 +20,7 @@ VIEWS = ("joint", "single", "reversed")
 def views(request: Request, view: str) -> list[Request]:
     """The requests answered for one request under ``view``."""
     if view == "single":
-        return [{"state": request["state"], "questions": {key: q}} for key, q in request["questions"].items()]
+        return [{**request, "questions": {key: q}} for key, q in request["questions"].items()]
     if view == "reversed":
         from .train.order import movable
 
@@ -29,7 +29,7 @@ def views(request: Request, view: str) -> list[Request]:
             return [request]
         flipped = {key: ({**q, "criteria": dict(reversed(list(q["criteria"].items())))} if key in moved else q)
                    for key, q in request["questions"].items()}
-        return [request, {"state": request["state"], "questions": flipped}]
+        return [request, {**request, "questions": flipped}]
     return [request]
 
 

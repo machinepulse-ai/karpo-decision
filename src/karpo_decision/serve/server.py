@@ -13,8 +13,9 @@ logged as one JSON line without content.
 A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``; the 31B may run its
 decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
 captured at load (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up
-with a text request, since Gemma reads text only (a Qwen3.5 checkpoint reads a screenshot too and warms up with
-one; the 12B and Qwen3.5 checkpoints serve the plain path); ``--triton-attention`` runs the global layers' attention
+with a text request for a block layout and a screenshot for a Qwen3.5 checkpoint; the 31B (a Gemma checkpoint with a
+vision tower, ``families/gemma/vision.py``) and Qwen3.5 read images, the 12B reads text only; the 12B and Qwen3.5
+checkpoints serve the plain path; ``--triton-attention`` runs the global layers' attention
 in one Triton kernel (sm_120 GPUs). Paths a backbone does not run are refused at startup (``serve.paths``).
 
 ``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
@@ -81,8 +82,8 @@ def screenshot_request() -> Request:
 
 
 def warmup_request(checkpoint: str) -> Request:
-    """The request that warms a checkpoint up: text only for a block layout (Gemma reads text only), a screenshot for
-    a joint layout (Qwen)."""
+    """The request that warms a checkpoint up: text for a block layout, a screenshot for a joint layout
+    (Qwen)."""
     if template(DecisionConfig.load(checkpoint).template).kind == BLOCKS:
         return graphs.WARMUP_REQUEST
     return screenshot_request()

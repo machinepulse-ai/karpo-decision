@@ -19,7 +19,7 @@ from transformers.models.gemma4.configuration_gemma4 import (  # noqa: E402
 )
 from transformers.models.gemma4.modeling_gemma4 import Gemma4Model  # noqa: E402
 
-from karpo_decision.encoding import open_image  # noqa: E402
+from karpo_decision.encoding import Encoded, open_image  # noqa: E402
 from karpo_decision.families import gemma  # noqa: E402
 from karpo_decision.families.gemma import vision  # noqa: E402
 
@@ -79,10 +79,71 @@ def test_the_default_budget_is_560_soft_tokens():
 
 def test_summary_gives_pixels_per_image_and_soft_tokens():
     v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
-    images = v.prepare([Image.new("RGB", (640, 480)), Image.new("RGB", (300, 900))])
-    pixels, tokens = v.summary(images.position_ids)
+    pictures = [Image.new("RGB", (640, 480)), Image.new("RGB", (300, 900))]
+    images = v.prepare(pictures)
+    pixels, tokens = v.summary([v.measure(picture) for picture in pictures])
     valid = (images.position_ids != -1).all(-1).sum(-1)
     assert pixels == (valid * 16 * 16).tolist() and tokens == sum(images.tokens)
+
+
+#: Sizes (width, height) whose soft tokens the size alone must give: ordinary, tiny, extreme aspect ratios, large.
+SIZES = [(640, 480), (300, 900), (1, 1), (1, 6000), (6000, 1), (47, 49), (4000, 3000), (1568, 1568)]
+
+
+@pytest.mark.parametrize("budget", [SMALL, vision.MAX_SOFT_TOKENS])
+def test_measure_counts_the_soft_tokens_the_processor_makes(budget):
+    v = vision.Vision(TOKENS, max_soft_tokens=budget)
+    for size in SIZES:
+        picture = Image.new("RGB", size)
+        assert v.measure(picture).tokens == v.prepare([picture]).tokens[0], size
+
+
+def test_measure_reads_bytes_data_urls_and_paths_whole(tmp_path):
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
+    picture = Image.new("RGB", (300, 900), (10, 200, 30))
+    path = tmp_path / "tall.png"
+    picture.save(path)
+    url = data_url(picture)
+    raw = base64.b64decode(url.partition(",")[2])
+    want = v.prepare([picture]).tokens[0]
+    assert [v.measure(value).tokens for value in (raw, url, str(path))] == [want] * 3
+    with pytest.raises((ValueError, OSError)):
+        v.measure(raw[: len(raw) // 2])  # its header reads, its pixels do not
+
+
+def sequence_with(*images):
+    return Encoded(keys=("q",), counts=(2,), input_ids=torch.arange(3), markers=torch.tensor([2]),
+                   images=images or None)
+
+
+def test_read_prepares_each_value_once_and_lays_the_images_out_in_row_order(monkeypatch):
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
+    red, tall = Image.new("RGB", (640, 480), (200, 30, 30)), Image.new("RGB", (300, 900), (10, 200, 30))
+    a, b = v.measure(red), v.measure(tall)
+    want = v.prepare([red, tall, red])
+    calls, prepare = [], vision.Vision.prepare
+    monkeypatch.setattr(vision.Vision, "prepare", lambda self, values: calls.append(values) or prepare(self, values))
+    text = sequence_with()
+    first, middle, last = v.read([sequence_with(a, b, a), text, sequence_with(b)])
+    assert torch.equal(first.pixel_values, want.pixel_values)
+    assert torch.equal(first.image_position_ids, want.position_ids)
+    assert middle is text and torch.equal(last.pixel_values, want.pixel_values[1:2]) and len(calls) == 2
+
+
+def test_read_refuses_a_count_the_plan_did_not_make():
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
+    picture = Image.new("RGB", (640, 480))
+    with pytest.raises(ValueError, match="planned at"):
+        v.read([sequence_with(vision.PlannedImage(picture, v.measure(picture).tokens + 1))])
+
+
+def test_open_image_reads_image_file_bytes():
+    buffer = io.BytesIO()
+    Image.new("RGB", (20, 10), (1, 2, 3)).save(buffer, format="PNG")
+    image = open_image(buffer.getvalue())
+    assert image.size == (20, 10) and image.getpixel((0, 0)) == (1, 2, 3)
+    with pytest.raises((ValueError, OSError)):
+        open_image(b"not an image")
 
 
 def test_a_data_url_that_is_not_an_image_is_refused():

@@ -1,16 +1,20 @@
-"""System One over HTTP for a decision checkpoint, under torchrun, one replica per GPU.
+"""System One over HTTP for a decision checkpoint, under torchrun, on one GPU or one copy per GPU.
 
     torchrun --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint path/to/checkpoint --port 18440
 
-Every rank loads the checkpoint on its own GPU and runs one request at a time. Rank 0 serves ``POST /v1/systemone``
-(``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a screenshot as an ``image_url`` part at
-``state.viewport_screenshot`` and more images at the top-level ``images``, as data URLs) and ``GET /healthz``, on
-loopback by default (no TLS or keys of its own), once every rank has loaded. Rank 0 encodes each request, so one
-outside the contract gets 400, and one with a question too long for the model gets 422, without reaching the other
-ranks. With ``--nproc_per_node N`` it runs the request on the rank with the fewest in flight, itself included: it
-hands the encoded sequences to that rank over a CPU (gloo) group of the two and gets the answers back the same way.
-The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers)
-times in milliseconds. Each request is logged as one JSON line without content.
+Rank 0 serves ``POST /v1/systemone`` (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out) and
+``GET /healthz``, on loopback by default (no TLS or keys of its own). Images come as TypeSafe's System One sends them
+(``assets`` referenced from the state, instructions or criteria, as base64 or as the parts of a multipart/form-data
+body after its ``request`` JSON part), as ``image_url`` parts with data URLs anywhere in those, or as the legacy
+screenshot at ``state.viewport_screenshot`` and ``images`` (data URLs). A body may be compressed with one
+Content-Encoding (gzip, x-gzip or zstd) and is at most ``MAX_BODY_BYTES`` compressed and decompressed (413; another
+encoding 415). Rank 0 encodes each request, so one outside the contract or with a question too long for the model gets
+422, and a body, image or asset it cannot read gets 400, without reaching the other ranks. Every rank loads the
+checkpoint on its own GPU and runs one request at a time: with ``--nproc_per_node N``, rank 0 runs each request on the
+rank with the fewest in flight, itself included, handing the encoded sequences to that rank over a CPU (gloo) group of
+the two and getting the answers back the same way; it listens once every rank has loaded. The
+``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers) times
+in milliseconds. Each request is logged as one JSON line without content.
 
 A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
 Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
@@ -47,45 +51,42 @@ from urllib.parse import urlsplit
 import torch
 import torch.distributed as dist
 
+from ..assets import AssetError
 from ..config import DecisionConfig
 from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..families.qwen import MODEL_TYPE as QWEN
-from ..protocol import IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
+from ..protocol import ASSETS, IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
 from ..templates import BLOCKS, template
-from . import graphs, qwen_fp8, qwen_graphs
+from . import graphs, qwen_fp8, qwen_graphs, wire
 from .fp8 import quantize
 from .paths import GRAPHS, backbone_type, path_name, require
 
 #: ``graphs`` is also an option of ``load_decider``, which would hide the module there.
 gemma_graphs = graphs
 
-MAX_BODY_BYTES = 4 * 1024 * 1024
+#: The largest body, compressed and decompressed (TypeSafe's limit).
+MAX_BODY_BYTES = 32 * 1024 * 1024
 #: The screenshot warm-up: a blank page as a JPEG data URL in the state, with one question.
 SCREENSHOT_WARMUP_SIZE = (768, 480)
 SCREENSHOT_WARMUP_GREY = (200, 200, 200)
 SCREENSHOT_WARMUP_JPEG_QUALITY = 75
 SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
 SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
-LOOPBACK_HOST = "127.0.0.1"
-DECIDE_PATH = "/v1/systemone"
-HEALTH_PATH = "/healthz"
-SERVER_TIMING_HEADER = "Server-Timing"
-#: The ranks only pass requests and answers to each other, on the CPU.
+#: The ranks pass requests and answers to each other on the CPU.
 CHANNEL_BACKEND = "gloo"
+#: A rank waits on its channel between requests for as long as the server is idle: the default 30-minute timeout
+#: would end it after the first quiet half hour.
+CHANNEL_TIMEOUT = datetime.timedelta(days=3650)
 #: What a rank sends rank 0 once it has loaded and warmed up.
 READY = "ready"
 #: What rank 0 sends a rank when the server stops.
 STOP = None
-#: A rank waits on its channel between requests for as long as the server is idle: the default 30-minute timeout
-#: would end it after the first quiet half hour.
-CHANNEL_TIMEOUT = datetime.timedelta(days=3650)
-RANK = int(os.environ.get("RANK", "0"))
 
 
 def log(**fields: Any) -> None:
-    print(json.dumps({"rank": RANK, **fields}), flush=True)
+    print(json.dumps(fields), flush=True)
 
 
 def screenshot_request() -> Request:
@@ -113,7 +114,7 @@ def warmup_request(checkpoint: str) -> Request:
 def load_decider(checkpoint: str, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
                  fp8: bool = False, fast: bool = True, triton_attention: bool = False,
                  graphs: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on its
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on one
     GPU. ``fp8``: the decoder projections in FP8, and CUDA graphs unless ``fast`` is false (``fast`` applies to ``fp8``
     alone) or the backbone has none. Gemma: single-question text-only requests up to the graphs' limit, not with the
     ``blackwell`` extra's kernels. Qwen3.5: any request read as one sequence (several questions or a screenshot
@@ -153,10 +154,10 @@ def scrub(node: Any) -> Any:
 
 
 def check_images(request: Request) -> None:
-    """Images come inline, a data URL each: a path would read the server's own files."""
+    """Legacy images come inline, a data URL each: a path would read the server's own files."""
     for image in images_of(request)[1]:
         if not (isinstance(image, str) and image.startswith(IMAGE_DATA_URL)):
-            raise RequestError("an image must be a data:image/... URL")
+            raise AssetError("an image must be a data:image/... URL")
 
 
 class Runner:
@@ -283,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if timing:
-            self.send_header(SERVER_TIMING_HEADER, timing)
+            self.send_header("Server-Timing", timing)
         self.end_headers()
         self.wfile.write(data)
 
@@ -294,14 +295,14 @@ class Handler(BaseHTTPRequestHandler):
         log(event="request", status=status, error=message[:200])
 
     def do_GET(self) -> None:
-        if urlsplit(self.path).path == HEALTH_PATH:
+        if urlsplit(self.path).path == "/healthz":
             self._send(200, {"ok": True, "model": self.server.name, **self.server.info})
         else:
             self._error(404, "not found")
 
     def do_POST(self) -> None:
         start = time.perf_counter()
-        if urlsplit(self.path).path != DECIDE_PATH:
+        if urlsplit(self.path).path != "/v1/systemone":
             return self._error(404, "not found", close=True)
         length = self.headers.get("Content-Length", "")
         if not length.isdigit():
@@ -310,18 +311,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(413, f"body is larger than {MAX_BODY_BYTES} bytes", close=True)
         decider = self.server.ranks.decider
         try:
-            body = scrub(json.loads(self.rfile.read(int(length))))
+            raw = wire.inflate(self.rfile.read(int(length)), self.headers.get(wire.CONTENT_ENCODING), MAX_BODY_BYTES)
+            content_type = self.headers.get(wire.CONTENT_TYPE, "")
+            parts: dict[str, bytes] = {}
+            if content_type.split(";")[0].strip().lower() == wire.MULTIPART:
+                raw, parts = wire.parse_multipart(raw, content_type)
+            body = scrub(json.loads(raw))
             if not isinstance(body, dict):
                 raise RequestError("the body must be a JSON object")
+            body = wire.claim(body, parts)
             request: Request = {"state": body.get("state", ""), "questions": body.get("questions")}
             if body.get("images"):
                 request["images"] = body["images"]
+            if body.get(ASSETS) is not None:
+                request[ASSETS] = body[ASSETS]
             encoding = time.perf_counter()
             check_images(request)
             plan = decider.plan(request)
-        except LengthError as error:  # a question that does not fit: the model declines it
+        except wire.TooLarge as error:
+            return self._error(413, str(error))
+        except wire.UnsupportedEncoding as error:
+            return self._error(415, str(error))
+        except (RequestError, LengthError) as error:  # outside the contract, or a question that does not fit
             return self._error(422, str(error))
-        except (ValueError, OSError) as error:  # json, the contract, an image that does not decode
+        except (ValueError, OSError) as error:  # the body, an image or an asset it cannot read
             return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - answer instead of dropping the connection
             log(event="request", status=500, error=type(error).__name__, stage="encode")
@@ -352,7 +365,7 @@ def positive(text: str) -> int:
 def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--host", default=LOOPBACK_HOST)
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
     parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
@@ -370,7 +383,7 @@ def main() -> None:
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
-    dist.init_process_group(CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
+    dist.init_process_group("nccl", device_id=device)
     rank, world = dist.get_rank(), dist.get_world_size()
     # One channel per other rank; every rank creates all of them, in the same order.
     groups = [dist.new_group([0, other], backend=CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
@@ -381,16 +394,16 @@ def main() -> None:
                                    graphs=args.graphs)
     loaded = time.time()
     decider.decide(warmup)
-    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
-            "path": path_name(args.fp8, isinstance(decider.model, (gemma_graphs.Graphs, qwen_graphs.CudaGraphs))),
-            "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
-    log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     runner = Runner(decider, device)
     if rank != 0:
         follow(runner, groups[rank - 1], rank)
         os._exit(0)
     ranks = Ranks(runner, [Channel(group, other) for other, group in enumerate(groups, start=1)])
     ranks.ready()
+    info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
+            "path": path_name(args.fp8, isinstance(decider.model, (gemma_graphs.Graphs, qwen_graphs.CudaGraphs))),
+            "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
+    log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     server = Server((args.host, args.port), ranks, args.name, info)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -401,7 +414,7 @@ def main() -> None:
     server.shutdown()
     server.server_close()
     ranks.stop()
-    # The process just ends, without tearing the process group down.
+    # The process just ends, without tearing the NCCL group down.
     os._exit(0)
 
 

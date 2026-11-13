@@ -49,3 +49,38 @@ def test_screenshot_as_an_image_url_part_is_its_data_url():
     state, images = images_of({"state": {"page": "x", VIEWPORT_SCREENSHOT: part}, "questions": {}, "images": [part]})
     assert state == {"page": "x"}
     assert images == ["data:image/jpeg;base64,AA", "data:image/jpeg;base64,AA"]
+
+
+ASK = {"q": {"type": "noul"}}
+
+
+@pytest.mark.parametrize(("assets", "message"), [
+    ({}, "nonempty object"),
+    ([], "nonempty object"),
+    ({"": {"format": "png", "data_base64": "AA=="}}, "nonempty strings"),
+    ({"k": "AA=="}, "of type 'image'"),
+    ({"k": {"type": "video", "format": "png", "data_base64": "AA=="}}, "of type 'image'"),
+    ({"k": {"type": "image"}}, "data_base64"),
+    ({"k": {"type": "image", "data_base64": "AA=="}}, "format"),
+    ({"k": {"type": "image", "format": "gif", "data_base64": "AA=="}}, "format"),
+    ({"k": {"part": 3}}, "multipart part"),
+])
+def test_validate_rejects_assets(assets, message):
+    with pytest.raises(RequestError, match=message):
+        validate({"state": "k", "questions": ASK, "assets": assets})
+
+
+@pytest.mark.parametrize("asset", [
+    {"type": "image", "format": "jpg", "data_base64": "AA=="}, {"part": "asset-0"},
+    {"type": "image", "part": "asset-0", "format": "nope"}, {"data": b"raw"}])
+def test_validate_accepts_typesafe_assets(asset):
+    validate({"state": "k", "questions": ASK, "assets": {"k": asset}})
+
+
+def test_validate_accepts_no_assets():
+    validate({"state": "k", "questions": ASK, "assets": None})
+
+
+def test_a_box_question_is_an_unknown_type():
+    with pytest.raises(RequestError, match="type must be"):
+        validate({"state": "s", "questions": {"where": {"type": "box", "instructions": "Find the cat"}}})

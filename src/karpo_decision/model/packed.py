@@ -71,6 +71,8 @@ def positions(backbone: Any, sequence: Encoded) -> torch.Tensor:
 
 
 def pack(sequences: Sequence[Encoded], backbone: Any, device: torch.device) -> Pack:
+    if any(s.images and s.pixel_values is None for s in sequences):
+        raise ValueError("a sequence's planned images have no pixels: Vision.read prepares them before packing")
     lengths = [s.length for s in sequences]
     blocks = [s.segment_ids is not None for s in sequences]
     if any(blocks) and not all(blocks):

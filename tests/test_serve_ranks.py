@@ -12,6 +12,7 @@ import pytest
 
 from karpo_decision.serve import server
 
+LOOPBACK = "127.0.0.1"
 WORLD = 4
 REQUESTS = 24
 CALLERS = 8
@@ -100,7 +101,7 @@ class SlowRunner:
 
 def one_rank(rank, port, results):
     """One process of the group: rank 0 fires the requests from several threads, the others follow."""
-    os.environ.update(RANK=str(rank), WORLD_SIZE=str(WORLD), MASTER_ADDR=server.LOOPBACK_HOST, MASTER_PORT=str(port))
+    os.environ.update(RANK=str(rank), WORLD_SIZE=str(WORLD), MASTER_ADDR=LOOPBACK, MASTER_PORT=str(port))
     dist = server.dist
     dist.init_process_group(server.CHANNEL_BACKEND, timeout=server.CHANNEL_TIMEOUT)
     groups = [dist.new_group([0, other], backend=server.CHANNEL_BACKEND, timeout=server.CHANNEL_TIMEOUT)
@@ -134,7 +135,7 @@ def one_rank(rank, port, results):
 
 def test_four_processes_share_the_requests_over_a_gloo_group():
     with socket.socket() as probe:
-        probe.bind((server.LOOPBACK_HOST, 0))
+        probe.bind((LOOPBACK, 0))
         port = probe.getsockname()[1]
     context = multiprocessing.get_context("spawn")
     results = context.Queue()

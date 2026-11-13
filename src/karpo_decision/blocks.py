@@ -1,8 +1,11 @@
 """Requests laid out in blocks (``templates.BlockTemplate``): a shared block and one branch per question, as token ids
 with each token's position and segment, for a family whose attention keeps branches apart (Gemma).
 
-- A request's images (``protocol.images_of``) sit in the shared block, after the context header and before the state
-  text (``families/gemma/vision.py``); a checkpoint without a vision tower refuses them.
+- A request's legacy images (``protocol.images_of``: the screenshot and ``images``) sit in the shared block, after the
+  context header and before the state text; its inline images (``assets.resolve``: asset references and image parts)
+  sit where they occur, in the state text, or in a question's instructions or criteria inside that question's branch,
+  where the shared block's list of questions shows ``IMAGE_PLACEHOLDER`` (``families/gemma/vision.py``). A checkpoint
+  without a vision tower refuses images.
 - A request with one question is one block (segment 0, positions 0..n-1): its state reads its question and options.
 - With several questions, the shared block (segment 0: system turn, the list of every question's instructions, the
   state) comes once, then each question's branch (segment k for the k-th branch of the sequence) with positions
@@ -24,11 +27,48 @@ from typing import Any
 
 import torch
 
-from .protocol import Question, Request, describe, images_of, options
+from .protocol import Question, Request, describe, options
 from .templates import DEFAULT_INSTRUCTIONS, BlockTemplate
 
-#: The line before each image when a request has several (k from 1).
+#: The line before each legacy image when a request has several (k from 1).
 IMAGE_LABEL = "Image {}:\n"
+#: What the shared block's list of questions shows for an image in a question's instructions.
+IMAGE_PLACEHOLDER = "[image]"
+#: The fewest ids an image takes (``begin``, one soft token, ``end``): with ``max_length`` it bounds the images the
+#: state or one question may place before any is read.
+MIN_IMAGE_IDS = 3
+
+
+class Reader:
+    """One request's inline images as its layout places them (``assets.Resolved``): each value read once
+    (``vision.measure``), the images of the block being laid out kept in row order, and the request failing
+    (``LengthError``) as soon as one block's inline images alone pass ``max_length``, before the next is read."""
+
+    def __init__(self, layout: BlockLayout, vision: Any, resolved: Any, max_length: int | None) -> None:
+        self.layout, self.vision, self.resolved, self.max_length = layout, vision, resolved, max_length
+        self.read: dict[int, Any] = {}
+        self.placed: list[Any] = []
+        self.need = 0
+
+    def image(self, k: int) -> list[int]:
+        """Inline image ``k``'s ids, placed in the current block."""
+        from .encoding import LengthError
+
+        value = self.resolved.inline[k]
+        if id(value) not in self.read:
+            self.read[id(value)] = self.vision.measure(value)
+        planned = self.read[id(value)]
+        self.placed.append(planned)
+        ids = self.layout.image(planned.tokens)
+        self.need += len(ids)
+        if self.max_length and self.need > self.max_length:
+            raise LengthError(f"the request's images need {self.need} tokens; the limit is {self.max_length}")
+        return ids
+
+    def block(self) -> list[Any]:
+        """The images placed since the last call, in row order; the next block starts."""
+        placed, self.placed, self.need = self.placed, [], 0
+        return placed
 
 
 class BlockLayout:
@@ -57,74 +97,99 @@ class BlockLayout:
                 raise ValueError(f"code {code!r} is not one token after {template.slot!r} and after '\\n('")
             self.labels.append(alone[0])
 
-    def text(self, value: Any) -> list[int]:
-        return self.tokenize(self.encoder.escape(describe(value)))
+    def text(self, value: Any, reader: Reader | None = None) -> list[int]:
+        """``describe(value)`` escaped and tokenized; with a ``reader``, each inline image (a sentinel) as its ids and
+        the text between tokenized piece by piece."""
+        if reader is None:
+            return self.tokenize(self.encoder.escape(describe(value)))
+        ids: list[int] = []
+        for piece in reader.resolved.pieces(describe(value)):
+            ids += reader.image(piece) if isinstance(piece, int) else self.tokenize(self.encoder.escape(piece))
+        return ids
+
+    def listed(self, question: Question, reader: Reader | None = None) -> list[int]:
+        """A question's instructions as the shared block lists them: each inline image as ``IMAGE_PLACEHOLDER``."""
+        if reader is None:
+            return self.instructions(question)
+        text = describe(question.get("instructions") or DEFAULT_INSTRUCTIONS)
+        text = "".join(IMAGE_PLACEHOLDER if isinstance(p, int) else p for p in reader.resolved.pieces(text))
+        return self.tokenize(self.encoder.escape(text))
 
     def instructions(self, question: Question) -> list[int]:
         return self.text(question.get("instructions") or DEFAULT_INSTRUCTIONS)
 
-    def image_ids(self, images: Any) -> list[int]:
-        """The images' part of the shared block: each as ``begin``, ``soft`` x its soft tokens, ``end`` and a newline,
-        after an ``IMAGE_LABEL`` line when there are several."""
+    def image(self, tokens: int) -> list[int]:
+        """One image: ``begin``, ``soft`` x its soft tokens, ``end``."""
         marks = self.encoder.processor.vision.tokens
+        return [marks.begin, *[marks.soft] * tokens, marks.end]
+
+    def image_ids(self, tokens: Sequence[int]) -> list[int]:
+        """The images' part of the shared block (``tokens``: each image's soft tokens): each image and a newline, after
+        an ``IMAGE_LABEL`` line when there are several."""
         ids: list[int] = []
-        for k, n in enumerate(images.tokens, start=1):
-            if len(images.tokens) > 1:
+        for k, n in enumerate(tokens, start=1):
+            if len(tokens) > 1:
                 ids += self.tokenize(IMAGE_LABEL.format(k))
-            ids += [marks.begin, *[marks.soft] * n, marks.end, *self.newline]
+            ids += self.image(n) + self.newline
         return ids
 
-    def prepare_images(self, vision: Any, values: list[Any], max_length: int | None) -> Any:
-        """``values`` prepared one at a time (``vision.prepare``): the processor scales even a tiny image up to its
+    def measure_images(self, vision: Any, values: list[Any], max_length: int | None) -> list[Any]:
+        """``values`` read one at a time (``vision.measure``): the processor scales even a tiny image up to its
         budget, so the request fails (``LengthError``) at the first image that takes the images' part of the shared
         block past ``max_length``, before the next is read."""
         from .encoding import LengthError
 
-        parts, need = [], 0
+        planned, need = [], 0
         for k, value in enumerate(values, start=1):
-            parts.append(vision.prepare([value]))
-            need += len(self.image_ids(parts[-1]))  # one image: no label
+            planned.append(vision.measure(value))
+            need += len(self.image(planned[-1].tokens)) + len(self.newline)
             if len(values) > 1:
                 need += len(self.tokenize(IMAGE_LABEL.format(k)))
             if max_length and need > max_length:
                 raise LengthError(f"the request's images need {need} tokens; the limit is {max_length}")
-        return vision.join(parts)
+        return planned
 
-    def shared(self, state: Any, questions: Sequence[Question], images: Any = None) -> list[int]:
+    def shared(self, state: Any, questions: Sequence[Question], images: Sequence[int] = (),
+               reader: Reader | None = None) -> list[int]:
+        """``images``: the legacy images' soft tokens; ``reader``: the request's inline images, if any."""
         ids = self.prefix + self.header
         for question in questions:
-            ids += self.item + self.instructions(question) + self.newline
-        return ids + self.context + (self.image_ids(images) if images is not None else []) + self.text(state)
+            ids += self.item + self.listed(question, reader) + self.newline
+        return ids + self.context + self.image_ids(images) + self.text(state, reader)
 
-    def branch(self, question: Question) -> list[int]:
+    def branch(self, question: Question, reader: Reader | None = None) -> list[int]:
         _, texts = options(question)
-        ids = self.question + self.instructions(question) + self.options
+        ids = self.question + self.text(question.get("instructions") or DEFAULT_INSTRUCTIONS, reader) + self.options
         for label, text in zip(self.labels, texts, strict=False):
-            ids += self.open + [label] + self.close + self.text(text) + self.newline
+            ids += self.open + [label] + self.close + self.text(text, reader) + self.newline
         return ids + self.tail
 
     def plan(self, request: Request, max_length: int | None) -> list[Any]:
+        from .assets import resolve
         from .encoding import Encoded, LengthError, TextOnlyError
 
-        state, values = images_of(request)
-        images = None
-        if values:
-            vision = getattr(self.encoder.processor, "vision", None)
-            if vision is None:
-                raise TextOnlyError("this checkpoint reads text only")
-            images = self.prepare_images(vision, values, max_length)
-        items = list(request["questions"].items())
-        shared = self.shared(state, [q for _, q in items], images)
-        branches = [(key, len(options(q)[0]), self.branch(q)) for key, q in items]
+        resolved = resolve(request, max_length // MIN_IMAGE_IDS if max_length else None)
+        vision = getattr(self.encoder.processor, "vision", None)
+        if vision is None and (resolved.legacy or resolved.inline):
+            raise TextOnlyError("this checkpoint reads text only")
+        legacy = self.measure_images(vision, resolved.legacy, max_length) if resolved.legacy else []
+        reader = Reader(self, vision, resolved, max_length) if resolved.inline else None
+        items = list(resolved.questions.items())
+        shared = self.shared(resolved.state, [q for _, q in items], [planned.tokens for planned in legacy], reader)
+        images = legacy + (reader.block() if reader else [])
+        branches = []
+        for key, q in items:
+            ids = self.branch(q, reader)
+            branches.append((key, len(options(q)[0]), ids, reader.block() if reader else []))
         limit = max_length or float("inf")
 
         def sequence(ids: list[int], positions: list[int], segments: list[int], markers: list[int],
-                     parts: list[tuple[str, int, list[int]]]) -> Encoded:
-            return Encoded(keys=tuple(k for k, _, _ in parts), counts=tuple(c for _, c, _ in parts),
+                     parts: list[tuple[str, int, list[int], list[Any]]]) -> Encoded:
+            placed = images + [planned for part in parts for planned in part[3]]
+            return Encoded(keys=tuple(part[0] for part in parts), counts=tuple(part[1] for part in parts),
                            input_ids=torch.tensor(ids), markers=torch.tensor(markers),
                            positions=torch.tensor(positions), segment_ids=torch.tensor(segments, dtype=torch.int16),
-                           pixel_values=None if images is None else images.pixel_values,
-                           image_position_ids=None if images is None else images.position_ids)
+                           images=tuple(placed) or None)
 
         if len(items) == 1:
             ids = shared + branches[0][2]

@@ -52,7 +52,8 @@ print(response["answers"])
 
 The 31B and the Qwen3.5 checkpoints also read a screenshot at `state.viewport_screenshot`, as an `image_url` part
 with a `data:image/...` URL. The 31B reads more images at `images` (data URLs; in Python also PIL images or file
-paths); each image takes up to 560 tokens of `--max-length` plus a few markers.
+paths), and images placed where the state or a question refers to them (see TypeSafe System One compatibility); each
+image takes up to 560 tokens of `--max-length` plus a few markers.
 
 ## Serving
 
@@ -100,6 +101,29 @@ Same top answer as the plain path, and latency per request (median / mean), one 
 `--fp8` includes the CUDA graphs; with `--no-fast` it is slower than the plain path on the Qwen3.5 checkpoints.
 Capturing the graphs takes 2-4 minutes at startup.
 
+## TypeSafe System One compatibility
+
+The server reads requests the way TypeSafe's System One API takes them, those of its Python SDK (`typesafe-sdk`)
+included:
+
+- `assets`: images by key, `{"<key>": {"type": "image", "format": "png", "data_base64": "..."}}`, the key written in a
+  string of the state, of a question's `instructions` or of its `criteria`, whole or inside text. In a
+  `multipart/form-data` body the `request` JSON part comes first and each asset names its part,
+  `{"type": "image", "part": "asset-0"}`.
+- `image_url` parts with a `data:image/...` URL anywhere in the state, the instructions or the criteria.
+- An image sits where it is referenced: in the state text, or in its question's branch, where the shared list of
+  questions shows `[image]`; each reference is one copy. `state.viewport_screenshot` (unless it holds an asset key)
+  and `images` still come before the state text.
+- Bodies of up to 32 MiB, compressed and decompressed, with one `Content-Encoding`: `gzip`, `x-gzip` or `zstd`.
+- 422 for a request outside the contract (a `box` question included) or too long; 400 for a body, image or asset it
+  cannot read or an asset rule it breaks (an unreferenced asset, an unclaimed part); 413 for a larger body; 415 for
+  another encoding.
+
+Unlike TypeSafe's API, image sizes are not checked (each image is scaled to up to 560 tokens) and there are no `box`
+questions. Placed images need the 31B: the Qwen3.5 checkpoints read only the screenshot and `images`, and the 12B
+reads text only (400). In Python, `Decider.decide` takes `assets` (with `data_base64`, or `data` as bytes) and image
+parts the same way.
+
 ## Decision Index
 
 ```bash
@@ -118,6 +142,7 @@ ignored with `graphs=true`).
 ```
 src/karpo_decision/
   protocol.py answers.py   the System One request contract and the answer shapes
+  assets.py                the images a request places in its text (TypeSafe's assets, image parts)
   config.py codes.py       a checkpoint's decision config and its answer codes
   templates.py blocks.py   how a request becomes text: one sequence (Qwen) or a shared block and branches (Gemma)
   encoding.py              tokens, segments and plans of a request
@@ -125,7 +150,8 @@ src/karpo_decision/
   decider.py               answering: encode, pack, one forward pass per pack, read out
   views.py                 other readings of a request (single, reversed) and how their answers join
   model/ families/         the packed forward pass and the readout; the Gemma 4 and Qwen3.5 backbones (families/)
-  serve/                   the HTTP server, the Decision Index kit's engine, the FP8 projections and the CUDA graphs
+  serve/                   the HTTP server and its request bodies, the Decision Index kit's engine, the FP8
+                           projections and the CUDA graphs
 ```
 
 ## Tests

@@ -26,6 +26,10 @@ sm_120), every global layer runs one call over all virtual sequences instead.
 The layers are re-expressed with the backbone's own modules and weights (``Gemma4TextDecoderLayer``: sandwich norms,
 q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
 embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are refused.
+
+A pack with images (``families/gemma/vision.py``) gets the vision tower's soft-token embeddings at the soft tokens'
+rows; in the sliding layers each image's soft tokens are recomputed after the varlen call so that they see their whole
+image (Gemma 4's bidirectional images; an image is shorter than the window).
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from torch.nn.attention.bias import causal_lower_right
 
 from ...config import Attention
 from ...model.packed import Pack, PackedLayers
-from . import fused, global_attention, sliding_attention
+from . import fused, global_attention, sliding_attention, vision
 
 SLIDING, GLOBAL = "sliding_attention", "full_attention"
 
@@ -64,6 +68,7 @@ class BlockPlan:
     m_cu_t: torch.Tensor  # m_cu on the device
     g_lens: torch.Tensor  # per virtual sequence its query and key lengths on the device (global_attention.lengths)
     m_lens: torch.Tensor  # the same with the markers as queries
+    images: vision.ImagePlan | None = None  # a pack with images (``vision.plan_images``)
 
 
 @dataclass
@@ -75,6 +80,7 @@ class PaddedPlan:
     size: int
     g_rows: None = None
     s_rows: None = None
+    images: None = None
 
     @property
     def q_cu_t(self) -> torch.Tensor:
@@ -223,9 +229,12 @@ class Packed(PackedLayers):
         query = self._q(attn, x, cos, sin)
         key, value = self._kv(attn, x, cos, sin)
         if attn.is_sliding:
+            whole = key, value
             key, value = self._gather(key, value, plan.s_rows)
             out = sliding_attention.attend(query[0], key[0], value[0], plan.q_cu_t, plan.s_cu_t, plan.max_q,
                                            plan.max_s, attn.scaling, self.sliding[0])
+            if plan.images is not None:
+                out = vision.see_whole(out, query[0], whole[0][0], whole[1][0], plan.images, attn.scaling)
             out = out.reshape(x.shape[1], -1)
         elif self.global_attend is not None:
             if isinstance(plan, PaddedPlan):
@@ -295,8 +304,19 @@ class Packed(PackedLayers):
     def forward(self, p: Pack) -> torch.Tensor:
         """(M, hidden) final-normalized hidden states at the markers, in pack order."""
         if p.cu_cpu is None or p.segment_ids_cpu is None:
-            raise ValueError("the Gemma family reads text-only block layouts (karpo-blocks-v1)")
+            raise ValueError("the Gemma family reads block layouts (karpo-blocks-v1)")
         p.plan = block_plan(p, self.window)
+        if p.pixel_values is not None:
+            if self.causal_global:
+                raise ValueError("images need a bidirectional checkpoint: a causal global layer would not let a soft "
+                                 "token see the rest of its image")
+            p.plan.images = vision.plan_images(p.input_ids.cpu(), p.cu_cpu.tolist(),
+                                               self.backbone.config.image_token_id, self.window, p.input_ids.device)
         h = self.embed(p.input_ids)
+        if p.pixel_values is not None:
+            features = vision.embed(self.backbone, p.pixel_values, p.image_position_ids)
+            if features.shape[0] != p.plan.images.rows.numel():
+                raise ValueError(f"{p.plan.images.rows.numel()} soft tokens for {features.shape[0]} image features")
+            h = h.index_copy(1, p.plan.images.rows, features[None].to(h.dtype))
         rope = self.rope(h, p.seqpos)
         return self.head(self.body(h, rope, p), rope, p)

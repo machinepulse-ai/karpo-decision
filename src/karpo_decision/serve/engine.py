@@ -5,14 +5,16 @@ process, one request at a time, and what the leaderboard's maintainers time.
         --option checkpoint=path/to/checkpoint --out runs/karpo-decision
 
 Options: ``checkpoint`` (required); ``view`` (default ``joint``; ``single`` or ``reversed``: ``karpo_decision.views``);
-``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false, the 31B only:
-the decoder projections in FP8, ``serve.fp8``; answers move by more than bf16 noise); ``fast`` (default true: with
-``fp8``, single-question text-only requests replay CUDA graphs captured at load, ``serve.graphs``; not with the
-``blackwell`` extra's kernels); ``triton_attention`` (default false, the 31B only: the global layers' attention in one
-Triton kernel, sm_120 GPUs, bidirectional checkpoints and a ``max_length`` under 131,072 only,
-``families.gemma.triton_attention``; answers move by bf16 noise); ``image_root`` (default none: the directory the kit's
-image references are relative to, read with the kit's loader and its pixel cap). A path the checkpoint's backbone does
-not run is refused before loading (``serve.paths``).
+``max_length`` (default ``DEFAULT_MAX_LENGTH``); ``device`` (default ``cuda``); ``fp8`` (default false, every
+checkpoint: the decoder projections in FP8, ``serve.fp8`` or ``serve.qwen_fp8``; answers move by more than bf16 noise);
+``fast`` (default true; with ``fp8`` alone, false skips the CUDA graphs captured at load: ``serve.graphs`` for
+single-question text-only requests, not with the ``blackwell`` extra's kernels, or ``serve.qwen_graphs``); ``graphs``
+(default false, Qwen3.5 checkpoints: CUDA graphs on the bf16 path); ``triton_attention`` (default false, Gemma
+checkpoints: the global layers' attention in one Triton kernel, sm_120 GPUs, bidirectional checkpoints and a
+``max_length`` within the checkpoint's limit, 131,072 for the 31B, only; ``families.gemma.triton_attention``; answers
+move by bf16 noise); ``image_root`` (default none: the directory the kit's image references are relative to, read with
+the kit's loader and its pixel cap). A path the checkpoint's backbone does not run is refused before loading
+(``serve.paths``).
 
 A request outside the contract, with an image that cannot be read, or with a question that does not fit ``max_length``
 tokens with its state and images is ``Unsupported``, and so is a request with images on the 12B, which reads text only.
@@ -34,11 +36,15 @@ from ..decider import DEFAULT_MAX_LENGTH, Decider
 from ..encoding import LengthError, TextOnlyError
 from ..families.gemma import vision
 from ..families.gemma.triton_attention import enable as enable_attention
+from ..families.qwen import MODEL_TYPE as QWEN
 from ..protocol import RequestError
 from ..views import VIEWS, joined, views
-from . import graphs
+from . import graphs, qwen_fp8, qwen_graphs
 from .fp8 import quantize
-from .paths import FP8, GRAPHS, TRITON_ATTENTION, require
+from .paths import FP8, GRAPHS, GRAPHS_OPTION, TRITON_ATTENTION, backbone_type, path_name, require
+
+#: ``graphs`` is also an option of the engine, which would hide the module in ``__init__``.
+gemma_graphs = graphs
 
 
 class DecisionIndexEngine(Engine):
@@ -49,30 +55,34 @@ class DecisionIndexEngine(Engine):
 
     def __init__(self, checkpoint: str, view: str = "joint", max_length: int = DEFAULT_MAX_LENGTH,
                  device: str = "cuda", fp8: bool = False, fast: bool = True, triton_attention: bool = False,
-                 image_root: str | None = None, **options: Any) -> None:
+                 graphs: bool = False, image_root: str | None = None, **options: Any) -> None:
         super().__init__(checkpoint=checkpoint, view=view, max_length=max_length, device=device, fp8=fp8, fast=fast,
-                         triton_attention=triton_attention, image_root=image_root, **options)
+                         triton_attention=triton_attention, graphs=graphs, image_root=image_root, **options)
         if view not in VIEWS:
             raise ValueError(f"view must be one of {VIEWS}")
-        for name, value in ((FP8, fp8), ("fast", fast), (TRITON_ATTENTION, triton_attention)):
+        for name, value in ((FP8, fp8), ("fast", fast), (TRITON_ATTENTION, triton_attention), (GRAPHS_OPTION, graphs)):
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be true or false, not {value!r}")
-        supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
+        supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention, graphs=graphs)
+        qwen = backbone_type(checkpoint) == QWEN
         if torch.device(device).index is not None:
             torch.cuda.set_device(torch.device(device))
         decider = Decider.from_pretrained(checkpoint, device=device, max_length=int(max_length))
         if fp8:
-            quantize(decider.model)
+            (qwen_fp8.quantize if qwen else quantize)(decider.model)
         if triton_attention:
             enable_attention(decider.model, decider.max_length)
-        if fp8:
-            decider.decide(graphs.WARMUP_REQUEST)  # the fused kernels compile on it with or without graphs
-        graphed = fp8 and fast and GRAPHS in supported and graphs.fast(decider)
+        if qwen:
+            captured = (graphs or (fp8 and fast)) and qwen_graphs.fast(decider)
+        else:
+            if fp8:
+                decider.decide(gemma_graphs.WARMUP_REQUEST)  # the fused kernels compile on it with or without graphs
+            captured = fp8 and fast and GRAPHS in supported and gemma_graphs.fast(decider)
         self.decider = decider
         self.view = view
         self.image_root = image_root
         self.vision = getattr(decider.encoder.processor, "vision", None)
-        self.path = "fp8-graphs" if graphed else "fp8" if fp8 else "plain"
+        self.path = path_name(fp8, bool(captured))
         self.kernels = ["triton-attention"] if triton_attention else []
         self.provenance = {"kind": "decision-checkpoint", "checkpoint": checkpoint, "path": self.path, "view": view,
                            "template": decider.config.template, "attention": decider.config.attention,

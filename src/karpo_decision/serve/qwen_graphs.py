@@ -27,7 +27,7 @@ from typing import Any
 import torch
 
 from ..families.qwen import Packed
-from ..model.packed import Pack
+from ..model.packed import MROPE_AXES, Pack
 
 #: (step, up to): 256-token buckets up to 4k, 512 up to 16k, 1,024 up to 32k.
 BUCKETS = ((256, 4096), (512, 16384), (1024, 32768))
@@ -77,7 +77,7 @@ class CudaGraphs:
         embed = model.lm.embed_tokens.weight
         # Input buffers shared by every graph (each reads its leading slice).
         self.hidden = torch.zeros(1, width, embed.shape[1], dtype=embed.dtype, device=embed.device)
-        self.rope = torch.zeros(3, 1, width, dtype=torch.long, device=embed.device)
+        self.rope = torch.zeros(MROPE_AXES, 1, width, dtype=torch.long, device=embed.device)
         # Output buffers shared by every graph: the body's output and the rotary tables the head reads.
         self.out = torch.zeros_like(self.hidden)
         cos, _ = model.lm.rotary_emb(self.hidden[:, :1], self.rope[..., :1])
@@ -86,6 +86,7 @@ class CudaGraphs:
         self.graphs: dict[tuple[int, int], Graph] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.replays = 0
+        self.compiled: list[Any] = []  # the recorded graphs launch the kernels of these compiled layers
 
     def padded(self, n: int, size: int, cu: torch.Tensor) -> Pack:
         """The pack a graph runs: n segments of ``size`` tokens for the causal layers, 2n sequences for attention."""
@@ -173,17 +174,24 @@ RECOMPILE_LIMIT = 16
 
 
 def fast(decider: Any) -> bool:
-    """The layers the graphs run compiled, then a CUDA graph captured for every bucket up to ``decider.max_length``
-    (minutes); False off CUDA. A bidirectional model's last layer runs at the markers only, outside the graphs, and
-    stays eager so that no request recompiles it."""
+    """The layers compiled while a CUDA graph is captured for every bucket up to min(``decider.max_length``, the
+    largest fine bucket, 65,536) (minutes), then the eager layers again: a replay runs the recorded kernels, and a
+    pack with no graph runs the plain path. False off CUDA. A bidirectional model's last layer runs at the markers
+    only, outside the graphs, and is never compiled."""
     if decider.device.type != "cuda":
         return False
     model = decider.model
     torch._dynamo.config.recompile_limit = RECOMPILE_LIMIT
-    for layer in model.layers[:-1] if model.prune_last else model.layers:
-        layer.packed_forward = torch.compile(layer.packed_forward, dynamic=True)
+    layers = model.layers[:-1] if model.prune_last else model.layers
+    eager = [layer.packed_forward for layer in layers]
+    compiled = [torch.compile(forward, dynamic=True) for forward in eager]
+    for layer, forward in zip(layers, compiled, strict=True):
+        layer.packed_forward = forward
     graphs = CudaGraphs(model, min(decider.max_length, FINE_BUCKETS[-1][1]), FINE_BUCKETS, WARMUP)
     with torch.cuda.device(decider.device):
         graphs.capture_all()
+    for layer, forward in zip(layers, eager, strict=True):
+        layer.packed_forward = forward
+    graphs.compiled = compiled
     decider.model = graphs
     return True

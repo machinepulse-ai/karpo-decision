@@ -152,11 +152,35 @@ def test_fast_replays_graphs_and_matches_the_plain_pass():
         expected = Packed(backbone, "bidirectional")(pack(seq, backbone, device)).float()
     model = Packed(backbone, "bidirectional")
     decider = types.SimpleNamespace(device=device, model=model, max_length=1024)
-    # torch.compile returns a wrapper function, so the compiled layer's packed_forward is no longer a bound method.
+    # fast() compiles the layers only while it captures the graphs, then restores the eager bound methods.
     assert inspect.ismethod(model.layers[0].packed_forward)
     assert fast(decider) and isinstance(decider.model, CudaGraphs)
-    assert not inspect.ismethod(model.layers[0].packed_forward)
+    # The compiled layers stay on the graphs (CudaGraphs.compiled); the layers themselves are eager again.
+    assert inspect.ismethod(model.layers[0].packed_forward)
+    assert decider.model.compiled
     with torch.inference_mode():
         got = decider.model(pack(seq, backbone, device)).float()
     assert decider.model.replays == 1
     assert torch.nn.functional.cosine_similarity(got, expected, dim=-1).min().item() > 0.999
+
+
+def test_fast_restores_the_eager_layers_for_packs_without_a_graph():
+    import types
+
+    from karpo_decision.serve.qwen_graphs import fast
+
+    backbone = build_backbone()
+    device = torch.device("cuda")
+    pair = sequences([200, 300], [2, 1])
+    with torch.inference_mode():
+        expected = Packed(backbone, "bidirectional")(pack(pair, backbone, device)).float()
+    model = Packed(backbone, "bidirectional")
+    decider = types.SimpleNamespace(device=device, model=model, max_length=1024)
+    assert fast(decider)
+    assert all(inspect.ismethod(layer.packed_forward) for layer in model.layers)
+    with torch.inference_mode():
+        got = decider.model(pack(pair, backbone, device)).float()
+        decider.model(pack(pair[:1], backbone, device))
+    # One graph covers a single sequence, so the pair runs the plain path: the same kernels, the same bits.
+    assert decider.model.replays == 1
+    assert torch.equal(got, expected)

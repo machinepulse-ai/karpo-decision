@@ -1,8 +1,8 @@
 """The Decision Index engine's path: plain by default, nothing answered at load; FP8 projections with ``fp8=true``, the
 graphs' warmup request answered, then CUDA graphs unless ``fast=false`` or the graphs do not apply; a non-boolean
 ``fp8``, ``fast`` or ``triton_attention`` is refused before loading. No GPU and no weights: the loader, the
-quantization and the capture are replaced. ``triton_attention`` enables the Triton global attention after the
-quantization and before the warmup."""
+quantization and the capture are replaced. ``triton_attention`` enables the Triton global attention, for the
+decider's ``max_length``, after the quantization and before the warmup."""
 
 import types
 
@@ -28,18 +28,32 @@ def decider():
       ["triton-attention"])],
     ids=["bf16", "fp8", "fp8-no-fast", "fp8-graphs-not-applicable", "bf16-triton-attention", "fp8-triton-attention"])
 def test_engine_path(monkeypatch, options, applies, path, called, kernels):
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "graphs", "triton_attention"}))
     calls, loaded = [], decider()
     loaded.decide = lambda request: calls.append(("decide", request))
     monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
     monkeypatch.setattr(engine, "quantize", lambda model: calls.append(("quantize", model)))
-    monkeypatch.setattr(engine, "enable_attention", lambda model: calls.append(("attention", model)))
+    monkeypatch.setattr(engine, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", (model, max_length))))
     monkeypatch.setattr(engine.graphs, "fast", lambda d: calls.append(("fast", d)) or applies)
     monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
     e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", **options)
-    received = {"quantize": loaded.model, "attention": loaded.model, "decide": engine.graphs.WARMUP_REQUEST,
-                "fast": loaded}
+    received = {"quantize": loaded.model, "attention": (loaded.model, loaded.max_length),
+                "decide": engine.graphs.WARMUP_REQUEST, "fast": loaded}
     assert e.path == path and e.provenance["path"] == path and calls == [(name, received[name]) for name in called]
     assert e.kernels == kernels and e.provenance["kernels"] == kernels and e.runtime()["kernels"] == kernels
+
+
+def test_engine_without_graphs_stays_on_fp8(monkeypatch):
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "triton_attention"}))
+    calls, loaded = [], decider()
+    loaded.decide = lambda request: calls.append("decide")
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    monkeypatch.setattr(engine, "quantize", lambda model: calls.append("quantize"))
+    monkeypatch.setattr(engine.graphs, "fast", lambda d: pytest.fail("graphs.fast called"))
+    monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)
+    assert e.path == "fp8" and calls == ["quantize", "decide"]
 
 
 def test_engine_refuses_a_non_boolean_fp8(monkeypatch):
@@ -61,3 +75,14 @@ def test_engine_refuses_a_non_boolean_triton_attention(monkeypatch):
                         classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="triton_attention"):
         engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", triton_attention="true")
+
+
+def test_engine_refuses_a_path_the_backbone_does_not_run(monkeypatch):
+    def refuse(checkpoint, **_):
+        raise ValueError("fp8 is not supported for qwen3_5 checkpoints")
+
+    monkeypatch.setattr(engine, "require", refuse)
+    monkeypatch.setattr(engine.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="not supported"):
+        engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)

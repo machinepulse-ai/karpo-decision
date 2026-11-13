@@ -6,21 +6,28 @@ Every rank loads the checkpoint on its own GPU and serves one request at a time.
 (``{"state", "questions"}`` in, ``{"id", "model", "answers", "usage"}`` out; a screenshot as an ``image_url`` part at
 ``state.viewport_screenshot``) and ``GET /healthz``, on loopback by default (no TLS or keys of its own), once every
 replica is up. With ``--nproc_per_node N`` it hands each request to the rank with the fewest in flight, itself
-included; rank r listens on loopback port ``port + r``. The ``Server-Timing`` header gives the request's encode,
-share (the hop through rank 0) and model (passes, readout, answers) times in milliseconds. Each request is logged
-by the rank that ran it, as one JSON line without content.
+included; rank r listens on loopback port ``port + r``. The rank that runs a request encodes it: one outside the
+contract gets 400, and one with a question too long for the model gets 422. The ``Server-Timing`` header gives the
+request's encode, share (the hop through rank 0) and model (passes, readout, answers) times in milliseconds. Each
+request is logged by the rank that ran it, as one JSON line without content.
 
-A Gemma 4 checkpoint serves through the ``Decider``, its decoder projections in
-FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs captured at load
-(``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up with a text
-request, since Gemma reads text only; ``--triton-attention`` runs the global layers' attention in one Triton kernel
-(sm_120 GPUs).
+A checkpoint serves through the ``Decider``; the 31B may run its
+decoder projections in FP8 with ``--fp8`` (``serve.fp8``), single-question requests then replaying CUDA graphs
+captured at load (``serve.graphs``, not with the ``blackwell`` extra's kernels; ``--no-fast`` skips them), warmed up
+with a text request, since Gemma reads text only (a Qwen3.5 checkpoint reads a screenshot too and warms up with
+one; the 12B and Qwen3.5 checkpoints serve the plain path); ``--triton-attention`` runs the global layers' attention
+in one Triton kernel (sm_120 GPUs). Paths a backbone does not run are refused at startup (``serve.paths``).
+
+``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention``, under
+131,072 for the 31B).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import http.client
+import io
 import json
 import os
 import re
@@ -28,23 +35,42 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
 import torch
 
-from ..decider import Decider
-from ..encoding import Encoded
+from ..config import DecisionConfig
+from ..decider import DEFAULT_MAX_LENGTH, Decider
+from ..encoding import Encoded, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
-from ..protocol import Request, RequestError, images_of
+from ..protocol import IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
+from ..templates import BLOCKS, template
 from . import graphs
 from .fp8 import quantize
+from .paths import GRAPHS, require
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
-#: How long rank 0 waits for a replica's answer: requests queue on the replica behind its running one.
-FORWARD_TIMEOUT = 600
+#: The screenshot warm-up: a blank page as a JPEG data URL in the state, with one question.
+SCREENSHOT_WARMUP_SIZE = (768, 480)
+SCREENSHOT_WARMUP_GREY = (200, 200, 200)
+SCREENSHOT_WARMUP_JPEG_QUALITY = 75
+SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
+SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
+LOOPBACK_HOST = "127.0.0.1"
+DECIDE_PATH = "/v1/systemone"
+HEALTH_PATH = "/healthz"
+SERVER_TIMING_HEADER = "Server-Timing"
+#: The encode and model times in a replica's ``Server-Timing``.
 TIMING = re.compile(r"(encode|model);dur=([0-9.]+)")
+#: How long rank 0 waits for a replica's answer: requests queue on the replica behind its running one.
+FORWARD_TIMEOUT_SECONDS = 600
+HEALTH_PROBE_TIMEOUT_SECONDS = 5
+HEALTH_POLL_INTERVAL_SECONDS = 0.1
+#: How long rank 0 waits for every replica to listen: a load and the graph capture take a few minutes.
+REPLICA_STARTUP_TIMEOUT_SECONDS = 3600
 RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
 
@@ -52,25 +78,44 @@ def log(**fields: Any) -> None:
     print(json.dumps({"rank": RANK, **fields}), flush=True)
 
 
-def text_warmup_request() -> Request:
-    """A tiny request without images, for a family that reads text only (Gemma)."""
-    return graphs.WARMUP_REQUEST
+def screenshot_request() -> Request:
+    """A tiny request with a page-sized screenshot: the first image a process reads sets up the vision tower's kernels
+    (seconds), so the server reads one before it listens."""
+    from PIL import Image
+
+    jpeg = io.BytesIO()
+    Image.new("RGB", SCREENSHOT_WARMUP_SIZE, SCREENSHOT_WARMUP_GREY).save(jpeg, "JPEG",
+                                                                         quality=SCREENSHOT_WARMUP_JPEG_QUALITY)
+    screenshot = {"type": IMAGE_URL,
+                  IMAGE_URL: {"url": IMAGE_DATA_URL + "jpeg;base64," + base64.b64encode(jpeg.getvalue()).decode()}}
+    return {"state": {"page": SCREENSHOT_WARMUP_PAGE, VIEWPORT_SCREENSHOT: screenshot},
+            "questions": SCREENSHOT_WARMUP_QUESTIONS}
 
 
-def load_decider(checkpoint: str, device: torch.device, fp8: bool = False,
-                 fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
-    """The ``Decider`` and the request that warms it up: a Gemma 4 checkpoint runs on its GPU, its decoder projections
-    in FP8 when ``fp8`` is true, and reads text only. With ``fp8``, single-question requests replay CUDA graphs unless
-    ``fast`` is false or the ``blackwell`` extra's kernels run. ``triton_attention``: the global layers' attention in
-    one Triton kernel (``families.gemma.triton_attention``)."""
-    decider = Decider.from_pretrained(checkpoint, device=device)
+def warmup_request(checkpoint: str) -> Request:
+    """The request that warms a checkpoint up: text only for a block layout (Gemma reads text only), a screenshot for
+    a joint layout (Qwen)."""
+    if template(DecisionConfig.load(checkpoint).template).kind == BLOCKS:
+        return graphs.WARMUP_REQUEST
+    return screenshot_request()
+
+
+def load_decider(checkpoint: str, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
+                 fp8: bool = False, fast: bool = True, triton_attention: bool = False) -> tuple[Decider, Request]:
+    """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on its
+    GPU. ``fp8``: the decoder projections in FP8, and single-question requests replaying CUDA graphs unless ``fast``
+    is false, the ``blackwell`` extra's kernels run or the backbone has no graphs. ``triton_attention``: the global
+    layers' attention in one Triton kernel (``families.gemma.triton_attention``). A path the backbone does not run is
+    refused before loading (``serve.paths``)."""
+    supported = require(checkpoint, fp8=fp8, triton_attention=triton_attention)
+    decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
     if fp8:
         quantize(decider.model)
     if triton_attention:
-        enable_attention(decider.model)
-    if fp8 and fast:
+        enable_attention(decider.model, max_length)
+    if fp8 and fast and GRAPHS in supported:
         graphs.fast(decider)
-    return decider, text_warmup_request()
+    return decider, warmup_request(checkpoint)
 
 
 def scrub(node: Any) -> Any:
@@ -92,7 +137,7 @@ def scrub(node: Any) -> Any:
 def check_images(request: Request) -> None:
     """Images come inline, a data URL each: a path would read the server's own files."""
     for image in images_of(request)[1]:
-        if not (isinstance(image, str) and image.startswith("data:image/")):
+        if not (isinstance(image, str) and image.startswith(IMAGE_DATA_URL)):
             raise RequestError("an image must be a data:image/... URL")
 
 
@@ -133,11 +178,11 @@ class Replicas:
 
     def forward(self, slot: int, body: bytes) -> tuple[int, bytes, str | None]:
         """The replica's status, body and ``Server-Timing`` for the request body, sent as it came."""
-        connection = http.client.HTTPConnection("127.0.0.1", self.ports[slot], timeout=FORWARD_TIMEOUT)
+        connection = http.client.HTTPConnection(LOOPBACK_HOST, self.ports[slot], timeout=FORWARD_TIMEOUT_SECONDS)
         try:
-            connection.request("POST", "/v1/systemone", body, {"Content-Type": "application/json"})
+            connection.request("POST", DECIDE_PATH, body)
             response = connection.getresponse()
-            return response.status, response.read(), response.getheader("Server-Timing")
+            return response.status, response.read(), response.getheader(SERVER_TIMING_HEADER)
         finally:
             connection.close()
 
@@ -146,9 +191,10 @@ class Replicas:
         deadline = time.monotonic() + timeout
         for slot in range(1, len(self.ports)):
             while True:
-                connection = http.client.HTTPConnection("127.0.0.1", self.ports[slot], timeout=5)
+                connection = http.client.HTTPConnection(LOOPBACK_HOST, self.ports[slot],
+                                                        timeout=HEALTH_PROBE_TIMEOUT_SECONDS)
                 try:
-                    connection.request("GET", "/healthz")
+                    connection.request("GET", HEALTH_PATH)
                     if connection.getresponse().status == 200:
                         break
                 except OSError:
@@ -157,12 +203,12 @@ class Replicas:
                     connection.close()
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"replica {slot} did not come up")
-                time.sleep(0.1)
+                time.sleep(HEALTH_POLL_INTERVAL_SECONDS)
 
 
 def listen_address(host: str, port: int, rank: int) -> tuple[str, int]:
     """Rank 0 listens where the server was asked to; replica r on loopback, r ports after it."""
-    return (host, port) if rank == 0 else ("127.0.0.1", port + rank)
+    return (host, port) if rank == 0 else (LOOPBACK_HOST, port + rank)
 
 
 class Server(ThreadingHTTPServer):
@@ -192,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if timing:
-            self.send_header("Server-Timing", timing)
+            self.send_header(SERVER_TIMING_HEADER, timing)
         self.end_headers()
         self.wfile.write(data)
 
@@ -203,14 +249,14 @@ class Handler(BaseHTTPRequestHandler):
         log(event="request", status=status, error=message[:200])
 
     def do_GET(self) -> None:
-        if urlsplit(self.path).path == "/healthz":
+        if urlsplit(self.path).path == HEALTH_PATH:
             self._send(200, {"ok": True, "model": self.server.name, **self.server.info})
         else:
             self._error(404, "not found")
 
     def do_POST(self) -> None:
         start = time.perf_counter()
-        if urlsplit(self.path).path != "/v1/systemone":
+        if urlsplit(self.path).path != DECIDE_PATH:
             return self._error(404, "not found", close=True)
         length = self.headers.get("Content-Length", "")
         if not length.isdigit():
@@ -255,7 +301,9 @@ class Handler(BaseHTTPRequestHandler):
             encoding = time.perf_counter()
             check_images(request)
             plan = decider.plan(request)
-        except (ValueError, OSError) as error:  # json, the contract, a question too long, an image that does not decode
+        except LengthError as error:  # a question that does not fit: the model declines it
+            return self._error(422, str(error))
+        except (ValueError, OSError) as error:  # json, the contract, an image that does not decode
             return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - answer instead of dropping the connection
             log(event="request", status=500, error=type(error).__name__, stage="encode")
@@ -272,40 +320,52 @@ class Handler(BaseHTTPRequestHandler):
         timing = f"encode;dur={encode_ms:.1f}, share;dur={shared:.1f}, model;dur={model_ms:.1f}"
         tokens = response["usage"]["input_tokens"]
         self._send(200, {"id": f"decision-{uuid.uuid4().hex}", "model": self.server.name,
-                         "answers": response["answers"], "usage": {"inputTokens": tokens, "outputTokens": 0}}, timing)
+                         "answers": response["answers"], "usage": {"input_tokens": tokens, "output_tokens": 0}}, timing)
         log(event="request", status=200, questions=len(response["answers"]), tokens=tokens, sequences=len(plan),
             encode_ms=round(encode_ms, 1), share_ms=round(shared, 1), model_ms=round(model_ms, 1),
             total_ms=round((done - start) * 1000, 1))
 
 
-def main() -> None:
+def positive(text: str) -> int:
+    if not text.isdecimal() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not a positive integer")
+    return int(text)
+
+
+def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default=LOOPBACK_HOST)
     parser.add_argument("--port", type=int, default=18440)
     parser.add_argument("--name", default="karpo-decision")
     parser.add_argument("--fp8", action="store_true", help="the decoder projections in FP8")
     parser.add_argument("--no-fast", action="store_true", help="with --fp8: no CUDA graphs")
     parser.add_argument("--triton-attention", action="store_true",
                         help="the global layers' attention in one Triton kernel (sm_120)")
-    args = parser.parse_args()
+    parser.add_argument("--max-length", type=positive, default=DEFAULT_MAX_LENGTH,
+                        help="the longest sequence in tokens")
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = arguments()
     local = int(os.environ["LOCAL_RANK"])
     world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, device, fp8=args.fp8, fast=not args.no_fast,
-                                   triton_attention=args.triton_attention)
+    decider, warmup = load_decider(args.checkpoint, device, args.max_length, fp8=args.fp8,
+                                   fast=not args.no_fast, triton_attention=args.triton_attention)
     loaded = time.time()
     decider.decide(warmup)
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
             "path": "fp8-graphs" if isinstance(decider.model, graphs.Graphs) else "fp8" if args.fp8 else "plain",
-            "kernels": ["triton-attention"] if args.triton_attention else []}
+            "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
     log(event="loaded", seconds=round(loaded - started), warmup_seconds=round(time.time() - loaded, 1), **info)
     replicas = None
     if local == 0 and world > 1:
         replicas = Replicas([args.port + rank for rank in range(world)])
-        replicas.wait(timeout=3600)
+        replicas.wait(timeout=REPLICA_STARTUP_TIMEOUT_SECONDS)
     address = listen_address(args.host, args.port, local)
     server = Server(address, Runner(decider, device), args.name, info, replicas)
     stop = threading.Event()

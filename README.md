@@ -1,12 +1,21 @@
 # karpo-decision
 
 The inference code of Karpo's decision model: a System One request in, typed decisions out, read by a trained
-readout from a Gemma 4 backbone. It answers through `karpo_decision.decider.Decider`, serves over HTTP with
+readout from a Gemma 4 or Qwen3.5 backbone. It answers through `karpo_decision.decider.Decider`, serves over HTTP with
 `karpo_decision.serve.server` (`POST /v1/systemone`, `GET /healthz`), and runs the
 [Decision Index](https://github.com/apolinario/decision-index) kit's suite with
 `karpo_decision.serve.engine:DecisionIndexEngine` (the kit installed separately).
 
-Model: [MachinePulseAI/karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B).
+Models:
+
+| Model | Backbone | Reads |
+|---|---|---|
+| [karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B) | Gemma 4 31B | text |
+| [karpo-decision-12B](https://huggingface.co/MachinePulseAI/karpo-decision-12B) | Gemma 4 12B | text |
+| [karpo-decision-9B](https://huggingface.co/MachinePulseAI/karpo-decision-9B) | Qwen3.5 9B | text, a screenshot |
+| [karpo-decision-4B](https://huggingface.co/MachinePulseAI/karpo-decision-4B) | Qwen3.5 4B | text, a screenshot |
+| [karpo-decision-2B](https://huggingface.co/MachinePulseAI/karpo-decision-2B) | Qwen3.5 2B | text, a screenshot |
+| [karpo-decision-0.8B](https://huggingface.co/MachinePulseAI/karpo-decision-0.8B) | Qwen3.5 0.8B | text, a screenshot |
 
 ## Install
 
@@ -14,7 +23,13 @@ Model: [MachinePulseAI/karpo-decision-31B](https://huggingface.co/MachinePulseAI
 pip install "karpo-decision @ git+https://github.com/machinepulse-ai/karpo-decision"
 ```
 
-On Blackwell GPUs, the `blackwell` extra adds faster attention kernels.
+The Qwen3.5 checkpoints need the `qwen` extra:
+
+```bash
+pip install "karpo-decision[qwen] @ git+https://github.com/machinepulse-ai/karpo-decision"
+```
+
+On Blackwell GPUs, the `blackwell` extra adds faster attention kernels for Gemma.
 
 ## Use
 
@@ -35,6 +50,9 @@ response = decider.decide({
 print(response["answers"])
 ```
 
+A Qwen3.5 checkpoint also reads a screenshot at `state.viewport_screenshot`, as an `image_url` part with a
+`data:image/...` URL.
+
 ## Serving
 
 ```bash
@@ -44,11 +62,15 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 `--nproc_per_node N` loads one replica per GPU: rank 0 hands each request to the replica with the fewest in
 flight, and replica r listens on loopback port `port + r`.
+`--fp8` and `--triton-attention` are for the 31B; the 12B and the Qwen3.5 checkpoints serve the plain path.
 `--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
 at startup (a few minutes) for single-question requests (not with the `blackwell` extra's kernels); `--no-fast` skips
 the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
+
+`--max-length` sets the longest sequence in tokens (default 32,768; under 131,072 with `--triton-attention`); a question
+that does not fit gets HTTP 422.
 
 With Docker:
 
@@ -74,12 +96,12 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
 src/karpo_decision/
   protocol.py answers.py   the System One request contract and the answer shapes
   config.py codes.py       a checkpoint's decision config and its answer codes
-  templates.py blocks.py   how a request becomes text: a shared block and one branch per question
+  templates.py blocks.py   how a request becomes text: one sequence (Qwen) or a shared block and branches (Gemma)
   encoding.py              tokens, segments and plans of a request
   checkpoint.py            a decision checkpoint on disk: config, processor, backbone, readout
   decider.py               answering: encode, pack, one forward pass per pack, read out
   views.py                 other readings of a request (single, reversed) and how their answers join
-  model/ families/         the packed forward pass and the readout; the Gemma 4 backbone (families/gemma)
+  model/ families/         the packed forward pass and the readout; the Gemma 4 and Qwen3.5 backbones (families/)
   serve/                   the HTTP server, the Decision Index kit's engine, the FP8 projections and the CUDA graphs
 ```
 
@@ -87,7 +109,7 @@ src/karpo_decision/
 
 ```bash
 uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
-.venv/bin/python -m pytest -q          # tests needing a GPU or a Gemma base skip without them
+.venv/bin/python -m pytest -q          # GPU, Gemma-base and KARPO_TOKENIZER (Qwen3.5) tests skip without them
 .venv/bin/ruff check src tests
 ```
 

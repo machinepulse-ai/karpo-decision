@@ -92,3 +92,32 @@ def test_raw_bytes_and_wrapped_base64():
 def test_rule_breaks_are_asset_errors(body, message):
     with pytest.raises(AssetError, match=message):
         resolve(body)
+
+
+class Tokenizer:
+    """Just enough of a tokenizer for an ``Encoder`` that never tokenizes."""
+
+    pad_token_id = 0
+    all_special_tokens = ["<m>"]
+
+    def encode(self, text, add_special_tokens=False):
+        return [1]
+
+    def convert_ids_to_tokens(self, token):
+        return "<m>"
+
+    def get_added_vocab(self):
+        return {}
+
+
+def test_a_joint_layout_refuses_inline_images():
+    from types import SimpleNamespace
+
+    from karpo_decision.encoding import Encoder, PlacementError
+    from karpo_decision.templates import JointTemplate
+
+    encoder = Encoder(SimpleNamespace(tokenizer=Tokenizer()), ("A", "B"), JointTemplate(), "<m>")
+    with pytest.raises(PlacementError, match="viewport_screenshot"):
+        encoder.plan(request("<k>", assets={"<k>": asset()}), None)
+    with pytest.raises(PlacementError):
+        encoder.plan(request({"shot": PART}), None)

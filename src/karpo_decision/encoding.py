@@ -33,6 +33,11 @@ class TextOnlyError(ValueError):
     """The request has images; this checkpoint reads text only."""
 
 
+class PlacementError(ValueError):
+    """The request has inline images (``assets.py``) and this checkpoint's joint layout (Qwen3.5) reads images only
+    before the text: the screenshot and ``images``."""
+
+
 @dataclass(frozen=True)
 class Encoded:
     """One tokenized sequence: a request, or a part of its questions. Tensors are 1-D over tokens, on CPU."""
@@ -44,7 +49,7 @@ class Encoded:
     #: Joint layouts with images: which tokens are image tokens (1) and which text (0).
     mm_token_type_ids: torch.Tensor | None = None
     #: With images, the processor's pixel values of every image: a joint layout's, or Gemma 4's (images, patches, 768)
-    #: in a block layout, prepared at pack time (``images``).
+    #: in a block layout.
     pixel_values: torch.Tensor | None = None
     #: Joint layouts with images: each image's (t, h, w) grid of patches.
     image_grid_thw: torch.Tensor | None = None
@@ -140,6 +145,10 @@ class Encoder:
         validate(request, len(self.codes))
         if self.blocks is not None:
             return self.blocks.plan(request, max_length)
+        from .assets import resolve
+
+        if resolve(request).inline:
+            raise PlacementError("this checkpoint reads images at state.viewport_screenshot and images only")
 
         def split(items: list[tuple[str, Question]]) -> list[Encoded]:
             encoded = self.encode({**request, "questions": dict(items)})

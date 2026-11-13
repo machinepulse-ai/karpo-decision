@@ -1,9 +1,9 @@
-"""The Decision Index engine's path: plain by default, nothing answered at load; FP8 projections with ``fp8=true``, the
-graphs' warmup request answered, then CUDA graphs unless ``fast=false`` or the graphs do not apply; a non-boolean
-``fp8``, ``fast`` or ``triton_attention`` is refused before loading. No GPU and no weights: the loader, the
-quantization and the capture are replaced. ``triton_attention`` enables the Triton global attention, for the
-decider's ``max_length``, after the quantization and before the warmup. A Qwen3.5 checkpoint quantizes with its own
-module and captures its graphs with ``graphs=true`` or ``fp8=true`` (no warm-up decide first)."""
+"""The Decision Index engine's path: plain by default, nothing answered at load; FP8 projections with ``fp8=true``,
+then the graphs' warmup request answered; CUDA graphs with ``graphs=true`` where they apply; a non-boolean ``fp8``,
+``graphs`` or ``triton_attention`` is refused before loading. No GPU and no weights: the loader, the quantization and
+the capture are replaced. ``triton_attention`` enables the Triton global attention, for the decider's ``max_length``,
+after the quantization and before the warmup. A Qwen3.5 checkpoint quantizes and captures with its own modules (no
+warm-up decide first)."""
 
 import sys
 import types
@@ -31,13 +31,17 @@ def decider():
 @pytest.mark.parametrize(
     ("options", "applies", "path", "called", "kernels"),
     [({"fp8": False}, True, "plain", [], []),
-     ({"fp8": True}, True, "fp8-graphs", ["quantize", "decide", "fast"], []),
-     ({"fp8": True, "fast": False}, True, "fp8", ["quantize", "decide"], []),
-     ({"fp8": True}, False, "fp8", ["quantize", "decide", "fast"], []),
+     ({"graphs": True}, True, "graphs", ["fast"], []),
+     ({"graphs": True}, False, "plain", ["fast"], []),
+     ({"fp8": True}, True, "fp8", ["quantize", "decide"], []),
+     ({"fp8": True, "graphs": True}, True, "fp8-graphs", ["quantize", "decide", "fast"], []),
+     ({"fp8": True, "graphs": True}, False, "fp8", ["quantize", "decide", "fast"], []),
      ({"triton_attention": True}, True, "plain", ["attention"], ["triton-attention"]),
-     ({"fp8": True, "triton_attention": True}, True, "fp8-graphs", ["quantize", "attention", "decide", "fast"],
-      ["triton-attention"])],
-    ids=["bf16", "fp8", "fp8-no-fast", "fp8-graphs-not-applicable", "bf16-triton-attention", "fp8-triton-attention"])
+     ({"graphs": True, "triton_attention": True}, True, "graphs", ["attention", "fast"], ["triton-attention"]),
+     ({"fp8": True, "graphs": True, "triton_attention": True}, True, "fp8-graphs",
+      ["quantize", "attention", "decide", "fast"], ["triton-attention"])],
+    ids=["bf16", "graphs", "graphs-not-applicable", "fp8", "fp8-graphs", "fp8-graphs-not-applicable",
+         "bf16-triton-attention", "graphs-triton-attention", "fp8-graphs-triton-attention"])
 def test_engine_path(monkeypatch, options, applies, path, called, kernels):
     monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "graphs", "triton_attention"}))
     calls, loaded = [], decider()
@@ -55,30 +59,11 @@ def test_engine_path(monkeypatch, options, applies, path, called, kernels):
     assert e.kernels == kernels and e.provenance["kernels"] == kernels and e.runtime()["kernels"] == kernels
 
 
-def test_engine_without_graphs_stays_on_fp8(monkeypatch):
-    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "triton_attention"}))
-    calls, loaded = [], decider()
-    loaded.decide = lambda request: calls.append("decide")
-    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
-    monkeypatch.setattr(engine, "quantize", lambda model: calls.append("quantize"))
-    monkeypatch.setattr(engine.graphs, "fast", lambda d: pytest.fail("graphs.fast called"))
-    monkeypatch.setattr(engine.torch.cuda, "get_device_name", lambda *_: "test-gpu")
-    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)
-    assert e.path == "fp8" and calls == ["quantize", "decide"]
-
-
 def test_engine_refuses_a_non_boolean_fp8(monkeypatch):
     monkeypatch.setattr(engine.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="fp8"):
         engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8="False")
-
-
-def test_engine_refuses_a_non_boolean_fast(monkeypatch):
-    monkeypatch.setattr(engine.Decider, "from_pretrained",
-                        classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
-    with pytest.raises(ValueError, match="fast"):
-        engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fast="False")
 
 
 def test_engine_refuses_a_non_boolean_triton_attention(monkeypatch):
@@ -166,14 +151,12 @@ def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(mo
 
 @pytest.mark.parametrize(("options", "path", "called"),
                          [({"graphs": True}, "graphs", ["fast"]),
-                          ({"graphs": True, "fast": False}, paths.GRAPHS_PATH, ["fast"]),
-                          ({"fp8": True}, "fp8-graphs", ["quantize", "fast"]),
-                          ({"fp8": True, "graphs": True}, paths.FP8_GRAPHS_PATH, ["quantize", "fast"]),
-                          ({"fp8": True, "fast": False}, "fp8", ["quantize"]),
+                          ({"fp8": True}, "fp8", ["quantize"]),
+                          ({"fp8": True, "graphs": True}, "fp8-graphs", ["quantize", "fast"]),
                           ({}, "plain", [])],
-                         ids=["graphs", "graphs-no-fast", "fp8", "fp8-graphs", "fp8-no-fast", "bf16"])
+                         ids=["graphs", "fp8", "fp8-graphs", "bf16"])
 def test_qwen_engine_path(monkeypatch, options, path, called):
-    opt_in = frozenset({paths.FP8, paths.GRAPHS, paths.BF16_GRAPHS})
+    opt_in = frozenset({paths.FP8, paths.GRAPHS})
     monkeypatch.setattr(engine, "require", lambda checkpoint, **_: opt_in)
     monkeypatch.setattr(engine, "backbone_type", lambda checkpoint: QWEN)
     calls, loaded = [], decider()

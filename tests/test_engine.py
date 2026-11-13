@@ -102,14 +102,14 @@ def test_engine_refuses_a_path_the_backbone_does_not_run(monkeypatch):
 def vision_decider(tokens=63):
     loaded = decider()
     loaded.encoder = types.SimpleNamespace(processor=types.SimpleNamespace(
-        vision=types.SimpleNamespace(summary=lambda position_ids: ([1_000_000], tokens))))
+        vision=types.SimpleNamespace(summary=lambda images: ([1_000_000], tokens))))
     loaded.plans = []
 
     def plan(request):
         loaded.plans.append(request)
         if request.get("images") == ["broken"]:
             raise OSError("cannot identify image file")
-        return [types.SimpleNamespace(image_position_ids="positions" if request.get("images") else None)]
+        return [types.SimpleNamespace(images=("planned",) if request.get("images") else None)]
 
     loaded.plan = plan
     loaded.decide = lambda readings, plans: [{"answers": {"q": {"choice": "a"}}, "usage": {"input_tokens": 1}}
@@ -151,7 +151,7 @@ def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(mo
     def plan(request):
         if request.get("images"):
             raise TextOnlyError("this checkpoint reads text only")
-        return [types.SimpleNamespace(image_position_ids=None)]
+        return [types.SimpleNamespace(images=None)]
 
     loaded.plan = plan
     monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset())

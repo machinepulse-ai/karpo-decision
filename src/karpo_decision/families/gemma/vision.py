@@ -1,11 +1,14 @@
 """Images for a Gemma 4 checkpoint with a vision tower (the 31B): each image as Gemma 4's image processor prepares it
 (at most ``MAX_SOFT_TOKENS`` soft tokens) and the soft-token embeddings the backbone's pretrained vision tower makes of
-it. ``blocks.py`` lays the soft tokens out in the shared block; ``packed.py`` writes the embeddings at their rows and
-lets each image's soft tokens see their whole image in the sliding layers (Gemma 4 reads an image bidirectionally)."""
+it. A plan holds each image as it came with its soft tokens, counted from its size alone (``Vision.measure``); its
+pixels are prepared only when its sequences are packed (``Vision.read``) and dropped after the pass. ``blocks.py`` lays
+the soft tokens out; ``packed.py`` writes the embeddings at their rows and lets each image's soft tokens see their
+whole image in the sliding layers (Gemma 4 reads an image bidirectionally)."""
 
 from __future__ import annotations
 
 import bisect
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +16,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ...encoding import open_image
+from ...encoding import Encoded, open_image
 
 #: Soft tokens per image at most (Gemma 4's processor takes 70, 140, 280, 560 or 1120): 5,040 patches of 16 x 16
 #: pixels pooled 3 x 3, about 1.29 MP.
@@ -28,6 +31,14 @@ class ImageTokens:
     begin: int
     soft: int
     end: int
+
+
+@dataclass(frozen=True)
+class PlannedImage:
+    """An image as a plan holds it: what ``encoding.open_image`` reads, and its soft tokens (``Vision.measure``)."""
+
+    value: Any
+    tokens: int
 
 
 @dataclass(frozen=True)
@@ -52,10 +63,52 @@ class Vision:
         return (position_ids != PADDING).all(-1).sum(-1)
 
     def prepare(self, values: Sequence[Any]) -> Images:
-        """``values``: PIL images, data URLs or file paths (``encoding.open_image``)."""
+        """``values``: PIL images, image file bytes, data URLs or file paths (``encoding.open_image``)."""
         out = self.processor(images=[open_image(value) for value in values], return_tensors="pt")
         pooled = self._valid(out["image_position_ids"]) // self.processor.pooling_kernel_size ** 2
         return Images(out["pixel_values"], out["image_position_ids"], tuple(int(n) for n in pooled))
+
+    def soft_tokens(self, height: int, width: int) -> int:
+        """Soft tokens of an image of ``height`` x ``width`` pixels: the processor's own resize target (Transformers'
+        ``get_aspect_ratio_preserving_size``) in patches, pooled."""
+        from transformers.models.gemma4.image_processing_pil_gemma4 import get_aspect_ratio_preserving_size
+
+        patch, pool = self.processor.patch_size, self.processor.pooling_kernel_size
+        h, w = get_aspect_ratio_preserving_size(height=height, width=width, patch_size=patch,
+                                                max_patches=self.processor.max_soft_tokens * pool ** 2,
+                                                pooling_kernel_size=pool)
+        return (h // patch) * (w // patch) // pool ** 2
+
+    def measure(self, value: Any) -> PlannedImage:
+        """``value`` read whole once, so an image that does not decode fails before any pass (a PIL image is read
+        already), and its soft tokens from its size; its pixels are not kept."""
+        from PIL import Image
+
+        width, height = value.size if isinstance(value, Image.Image) else open_image(value).size
+        return PlannedImage(value, self.soft_tokens(height, width))
+
+    def read(self, sequences: Sequence[Encoded]) -> list[Encoded]:
+        """``sequences`` with the pixels of their planned images (``Encoded.images``): each image prepared on its own
+        (``prepare``) and laid out in row order, a value several images share prepared once."""
+        prepared: dict[int, Images] = {}
+        out = []
+        for s in sequences:
+            if not s.images:
+                out.append(s)
+                continue
+            parts = []
+            for planned in s.images:
+                key = id(planned.value)
+                if key not in prepared:
+                    prepared[key] = self.prepare([planned.value])
+                if prepared[key].tokens[0] != planned.tokens:
+                    raise ValueError(f"an image planned at {planned.tokens} soft tokens has "
+                                     f"{prepared[key].tokens[0]}")
+                parts.append(prepared[key])
+            images = self.join(parts)
+            out.append(dataclasses.replace(s, pixel_values=images.pixel_values,
+                                           image_position_ids=images.position_ids))
+        return out
 
     @staticmethod
     def join(parts: Sequence[Images]) -> Images:
@@ -63,11 +116,10 @@ class Vision:
         return Images(torch.cat([p.pixel_values for p in parts]), torch.cat([p.position_ids for p in parts]),
                       tuple(n for p in parts for n in p.tokens))
 
-    def summary(self, position_ids: torch.Tensor) -> tuple[list[int], int]:
-        """Each image's pixels as the vision tower reads them, and the soft tokens of them all."""
-        valid = self._valid(position_ids)
-        pixels = (valid * self.processor.patch_size ** 2).tolist()
-        return pixels, int((valid // self.processor.pooling_kernel_size ** 2).sum())
+    def summary(self, images: Sequence[PlannedImage]) -> tuple[list[int], int]:
+        """Each planned image's pixels as the vision tower reads them, and the soft tokens of them all."""
+        per_token = self.processor.pooling_kernel_size ** 2 * self.processor.patch_size ** 2
+        return [planned.tokens * per_token for planned in images], sum(planned.tokens for planned in images)
 
 
 def embed(backbone: Any, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:

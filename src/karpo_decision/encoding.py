@@ -44,7 +44,7 @@ class Encoded:
     #: Joint layouts with images: which tokens are image tokens (1) and which text (0).
     mm_token_type_ids: torch.Tensor | None = None
     #: With images, the processor's pixel values of every image: a joint layout's, or Gemma 4's (images, patches, 768)
-    #: in a block layout.
+    #: in a block layout, prepared at pack time (``images``).
     pixel_values: torch.Tensor | None = None
     #: Joint layouts with images: each image's (t, h, w) grid of patches.
     image_grid_thw: torch.Tensor | None = None
@@ -54,6 +54,9 @@ class Encoded:
     #: (0 the shared block, k the k-th branch). None: positions 0..n-1, one segment.
     positions: torch.Tensor | None = None
     segment_ids: torch.Tensor | None = None
+    #: Gemma 4 block layouts with images: each image in row order (``vision.PlannedImage``), its pixels prepared at
+    #: pack time (``Vision.read`` fills ``pixel_values`` and ``image_position_ids``).
+    images: tuple[Any, ...] | None = None
 
     @property
     def length(self) -> int:

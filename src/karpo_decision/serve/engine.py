@@ -111,7 +111,7 @@ class DecisionIndexEngine(Engine):
         response = {"model": self.name, **joined(request, self.decider.decide(readings, plans), self.view)}
         if not images or self.vision is None:
             return response, None
-        pixels, tokens = self.vision.summary(plans[0][0].image_position_ids)
+        pixels, tokens = self.vision.summary(plans[0][0].images)
         return response, {"image_pixels": pixels, "image_tokens": tokens}
 
     def runtime(self) -> dict[str, Any]:

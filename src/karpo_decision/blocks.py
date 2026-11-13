@@ -63,38 +63,43 @@ class BlockLayout:
     def instructions(self, question: Question) -> list[int]:
         return self.text(question.get("instructions") or DEFAULT_INSTRUCTIONS)
 
-    def image_ids(self, images: Any) -> list[int]:
-        """The images' part of the shared block: each as ``begin``, ``soft`` x its soft tokens, ``end`` and a newline,
-        after an ``IMAGE_LABEL`` line when there are several."""
+    def image(self, tokens: int) -> list[int]:
+        """One image: ``begin``, ``soft`` x its soft tokens, ``end``."""
         marks = self.encoder.processor.vision.tokens
+        return [marks.begin, *[marks.soft] * tokens, marks.end]
+
+    def image_ids(self, tokens: Sequence[int]) -> list[int]:
+        """The images' part of the shared block (``tokens``: each image's soft tokens): each image and a newline, after
+        an ``IMAGE_LABEL`` line when there are several."""
         ids: list[int] = []
-        for k, n in enumerate(images.tokens, start=1):
-            if len(images.tokens) > 1:
+        for k, n in enumerate(tokens, start=1):
+            if len(tokens) > 1:
                 ids += self.tokenize(IMAGE_LABEL.format(k))
-            ids += [marks.begin, *[marks.soft] * n, marks.end, *self.newline]
+            ids += self.image(n) + self.newline
         return ids
 
-    def prepare_images(self, vision: Any, values: list[Any], max_length: int | None) -> Any:
-        """``values`` prepared one at a time (``vision.prepare``): the processor scales even a tiny image up to its
+    def measure_images(self, vision: Any, values: list[Any], max_length: int | None) -> list[Any]:
+        """``values`` read one at a time (``vision.measure``): the processor scales even a tiny image up to its
         budget, so the request fails (``LengthError``) at the first image that takes the images' part of the shared
         block past ``max_length``, before the next is read."""
         from .encoding import LengthError
 
-        parts, need = [], 0
+        planned, need = [], 0
         for k, value in enumerate(values, start=1):
-            parts.append(vision.prepare([value]))
-            need += len(self.image_ids(parts[-1]))  # one image: no label
+            planned.append(vision.measure(value))
+            need += len(self.image(planned[-1].tokens)) + len(self.newline)
             if len(values) > 1:
                 need += len(self.tokenize(IMAGE_LABEL.format(k)))
             if max_length and need > max_length:
                 raise LengthError(f"the request's images need {need} tokens; the limit is {max_length}")
-        return vision.join(parts)
+        return planned
 
-    def shared(self, state: Any, questions: Sequence[Question], images: Any = None) -> list[int]:
+    def shared(self, state: Any, questions: Sequence[Question], images: Sequence[int] = ()) -> list[int]:
+        """``images``: the images' soft tokens."""
         ids = self.prefix + self.header
         for question in questions:
             ids += self.item + self.instructions(question) + self.newline
-        return ids + self.context + (self.image_ids(images) if images is not None else []) + self.text(state)
+        return ids + self.context + self.image_ids(images) + self.text(state)
 
     def branch(self, question: Question) -> list[int]:
         _, texts = options(question)
@@ -107,14 +112,14 @@ class BlockLayout:
         from .encoding import Encoded, LengthError, TextOnlyError
 
         state, values = images_of(request)
-        images = None
+        images = []
         if values:
             vision = getattr(self.encoder.processor, "vision", None)
             if vision is None:
                 raise TextOnlyError("this checkpoint reads text only")
-            images = self.prepare_images(vision, values, max_length)
+            images = self.measure_images(vision, values, max_length)
         items = list(request["questions"].items())
-        shared = self.shared(state, [q for _, q in items], images)
+        shared = self.shared(state, [q for _, q in items], [planned.tokens for planned in images])
         branches = [(key, len(options(q)[0]), self.branch(q)) for key, q in items]
         limit = max_length or float("inf")
 
@@ -123,8 +128,7 @@ class BlockLayout:
             return Encoded(keys=tuple(k for k, _, _ in parts), counts=tuple(c for _, c, _ in parts),
                            input_ids=torch.tensor(ids), markers=torch.tensor(markers),
                            positions=torch.tensor(positions), segment_ids=torch.tensor(segments, dtype=torch.int16),
-                           pixel_values=None if images is None else images.pixel_values,
-                           image_position_ids=None if images is None else images.position_ids)
+                           images=tuple(images) or None)
 
         if len(items) == 1:
             ids = shared + branches[0][2]

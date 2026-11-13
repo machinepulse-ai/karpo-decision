@@ -43,7 +43,7 @@ def test_one_question_with_an_image_reads_as_gemma_4_lays_images_out(encoder):
             + layout.context + [marks.begin] + [marks.soft] * n + [marks.end] + layout.newline + layout.text(STATE)
             + layout.branch(QUESTION))
     assert part.input_ids.tolist() == want
-    assert part.pixel_values.shape[0] == part.image_position_ids.shape[0] == 1
+    assert [planned.tokens for planned in part.images] == [n] and part.pixel_values is None
     assert 0 < n <= 560
 
 
@@ -69,7 +69,8 @@ def test_the_viewport_screenshot_comes_first(encoder):
     state = {**STATE, "viewport_screenshot": {"type": "image_url", "image_url": {"url": url}}}
     (part,) = encoder.plan({"state": state, "questions": {"q": QUESTION}, "images": [picture(300, 900)]}, None)
     first = encoder.processor.vision.prepare([url, picture(300, 900)])
-    torch.testing.assert_close(part.pixel_values, first.pixel_values)
+    assert part.images[0].value == url
+    assert torch.equal(encoder.processor.vision.read([part])[0].pixel_values, first.pixel_values)
 
 
 def test_several_questions_read_the_images_once_in_the_shared_block(encoder):
@@ -88,7 +89,7 @@ def test_a_split_request_repeats_its_images_in_every_part(encoder):
     parts = encoder.plan(request, shared + max(int((whole.segment_ids == k).sum()) for k in (1, 2)))
     assert len(parts) == 2
     assert all(int((p.input_ids == marks.begin).sum()) == 1 for p in parts)
-    assert parts[0].pixel_values is parts[1].pixel_values
+    assert parts[0].images[0] is parts[1].images[0]
 
 
 def test_images_count_in_the_length(encoder):
@@ -99,27 +100,27 @@ def test_images_count_in_the_length(encoder):
 
 
 def test_images_past_the_limit_fail_before_the_rest_are_read(encoder, monkeypatch):
-    """Even a tiny image is scaled up to the processor's budget: images are prepared one at a time, and the first whose
+    """Even a tiny image is scaled up to the processor's budget: images are read one at a time, and the first whose
     tokens alone pass ``max_length`` fails the request."""
-    n = encoder.processor.vision.prepare([picture()]).tokens[0]
-    prepared, prepare = [], gemma.vision.Vision.prepare
+    n = encoder.processor.vision.measure(picture()).tokens
+    read, measure = [], gemma.vision.Vision.measure
 
-    def counted(self, values):
-        prepared.extend(values)
-        return prepare(self, values)
+    def counted(self, value):
+        read.append(value)
+        return measure(self, value)
 
-    monkeypatch.setattr(gemma.vision.Vision, "prepare", counted)
+    monkeypatch.setattr(gemma.vision.Vision, "measure", counted)
     request = {"state": STATE, "questions": {"q": QUESTION}, "images": [picture()] * 40}
     with pytest.raises(LengthError, match="images need"):
         encoder.plan(request, 2 * n)  # one image with its markers fits, the second passes the limit
-    assert len(prepared) == 2
+    assert len(read) == 2
 
 
 def test_text_requests_lay_out_as_before(encoder):
     (part,) = encoder.plan({"state": STATE, "questions": {"q": QUESTION}}, None)
     layout = encoder.blocks
     assert part.input_ids.tolist() == layout.shared(STATE, [QUESTION]) + layout.branch(QUESTION)
-    assert part.pixel_values is None and part.image_position_ids is None
+    assert part.images is None and part.pixel_values is None and part.image_position_ids is None
 
 
 def test_a_checkpoint_without_vision_refuses_images(encoder):

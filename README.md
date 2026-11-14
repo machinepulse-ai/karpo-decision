@@ -6,16 +6,23 @@ readout from a Gemma 4 or Qwen3.5 backbone. It answers through `karpo_decision.d
 [Decision Index](https://github.com/apolinario/decision-index) kit's suite with
 `karpo_decision.serve.engine:DecisionIndexEngine` (the kit installed separately).
 
+karpo-decision-31B has the highest Full score on the
+[Decision Index board](https://huggingface.co/spaces/multimodalart/jev-decision-index) (November 12, 2026):
+
+![Decision Index, Full score: karpo-decision-31B first](docs/decision-index-full.png)
+
 Models:
 
 | Model | Backbone | Reads |
 |---|---|---|
 | [karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B) | Gemma 4 31B | text, images |
 | [karpo-decision-12B](https://huggingface.co/MachinePulseAI/karpo-decision-12B) | Gemma 4 12B | text |
-| [karpo-decision-9B](https://huggingface.co/MachinePulseAI/karpo-decision-9B) | Qwen3.5 9B | text, a screenshot |
-| [karpo-decision-4B](https://huggingface.co/MachinePulseAI/karpo-decision-4B) | Qwen3.5 4B | text, a screenshot |
-| [karpo-decision-2B](https://huggingface.co/MachinePulseAI/karpo-decision-2B) | Qwen3.5 2B | text, a screenshot |
-| [karpo-decision-0.8B](https://huggingface.co/MachinePulseAI/karpo-decision-0.8B) | Qwen3.5 0.8B | text, a screenshot |
+| [karpo-decision-9B](https://huggingface.co/MachinePulseAI/karpo-decision-9B) | Qwen3.5 9B | text, images |
+| [karpo-decision-4B](https://huggingface.co/MachinePulseAI/karpo-decision-4B) | Qwen3.5 4B | text, images |
+| [karpo-decision-2B](https://huggingface.co/MachinePulseAI/karpo-decision-2B) | Qwen3.5 2B | text, images |
+| [karpo-decision-0.8B](https://huggingface.co/MachinePulseAI/karpo-decision-0.8B) | Qwen3.5 0.8B | text, images |
+
+![Score vs. size on the Decision Index public suite](docs/score-vs-size.png)
 
 ## Install
 
@@ -50,10 +57,10 @@ response = decider.decide({
 print(response["answers"])
 ```
 
-The 31B and the Qwen3.5 checkpoints also read a screenshot at `state.viewport_screenshot`, as an `image_url` part
-with a `data:image/...` URL. The 31B reads more images at `images` (data URLs; in Python also PIL images or file
-paths), and images placed where the state or a question refers to them (see TypeSafe System One compatibility); each
-image takes up to 560 tokens of `--max-length` plus a few markers.
+The 31B and the Qwen3.5 checkpoints also read images: a screenshot at `state.viewport_screenshot`, as an `image_url`
+part with a `data:image/...` URL, and more at `images` (data URLs; in Python also PIL images or file paths). The 31B
+also reads images placed where the state or a question refers to them (see TypeSafe System One compatibility); each
+of its images takes up to 560 tokens of `--max-length` plus a few markers.
 
 ## Serving
 
@@ -165,4 +172,10 @@ uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
 
 ## License
 
-Apache-2.0 ([LICENSE](LICENSE)).
+Copyright (c) 2026 MachinePulse Limited.
+
+The code in this repository is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)).
+
+The model weights are not part of this repository. They are licensed separately, under the MachinePulse Community
+License in each model's Hugging Face repository (for the 31B:
+[LICENSE](https://huggingface.co/MachinePulseAI/karpo-decision-31B/blob/main/LICENSE)).

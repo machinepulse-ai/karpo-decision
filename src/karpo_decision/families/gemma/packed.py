@@ -29,7 +29,8 @@ embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are 
 
 A pack with images (``families/gemma/vision.py``) gets the vision tower's soft-token embeddings at the soft tokens'
 rows; in the sliding layers each image's soft tokens are recomputed after the varlen call so that they see their whole
-image (Gemma 4's bidirectional images; an image is no longer than the window).
+image (Gemma 4's bidirectional images; an image is no longer than the window), an image in a branch with what the
+branch sees.
 """
 
 from __future__ import annotations
@@ -310,7 +311,7 @@ class Packed(PackedLayers):
             if self.causal_global:
                 raise ValueError("images are supported on bidirectional checkpoints only, the ones the image path was "
                                  "validated on")
-            p.plan.images = vision.plan_images(p.input_ids.cpu(), p.cu_cpu.tolist(),
+            p.plan.images = vision.plan_images(p.input_ids.cpu(), p.cu_cpu.tolist(), p.segment_ids_cpu, p.seqpos.cpu(),
                                                self.backbone.config.image_token_id, self.window, p.input_ids.device)
         h = self.embed(p.input_ids)
         if p.pixel_values is not None:

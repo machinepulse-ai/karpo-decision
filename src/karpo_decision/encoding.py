@@ -33,6 +33,11 @@ class TextOnlyError(ValueError):
     """The request has images; this checkpoint reads text only."""
 
 
+class PlacementError(ValueError):
+    """The request has inline images (``assets.py``) and this checkpoint's joint layout (Qwen3.5) reads images only
+    before the text: the screenshot and ``images``."""
+
+
 @dataclass(frozen=True)
 class Encoded:
     """One tokenized sequence: a request, or a part of its questions. Tensors are 1-D over tokens, on CPU."""
@@ -54,6 +59,9 @@ class Encoded:
     #: (0 the shared block, k the k-th branch). None: positions 0..n-1, one segment.
     positions: torch.Tensor | None = None
     segment_ids: torch.Tensor | None = None
+    #: Gemma 4 block layouts with images: each image in row order (``vision.PlannedImage``), its pixels prepared at
+    #: pack time (``Vision.read`` fills ``pixel_values`` and ``image_position_ids``).
+    images: tuple[Any, ...] | None = None
 
     @property
     def length(self) -> int:
@@ -61,13 +69,16 @@ class Encoded:
 
 
 def open_image(value: Any) -> Any:
-    """A PIL image from a data URL, a file path or an image; ValueError or OSError when it does not decode (PIL's
-    decompression bomb error is neither, so it becomes a ValueError)."""
+    """A PIL image from image file bytes, a data URL, a file path or an image; ValueError or OSError when it does not
+    decode (PIL's decompression bomb error is neither, so it becomes a ValueError)."""
     from PIL import Image
 
     if isinstance(value, Image.Image):
         return value.convert("RGB")
     try:
+        if isinstance(value, bytes):
+            with Image.open(io.BytesIO(value)) as image:
+                return image.convert("RGB")
         if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
             with Image.open(io.BytesIO(base64.b64decode(value.partition(",")[2], validate=True))) as image:
                 return image.convert("RGB")
@@ -134,6 +145,10 @@ class Encoder:
         validate(request, len(self.codes))
         if self.blocks is not None:
             return self.blocks.plan(request, max_length)
+        from .assets import places_images
+
+        if places_images(request):
+            raise PlacementError("this checkpoint reads images at state.viewport_screenshot and images only")
 
         def split(items: list[tuple[str, Question]]) -> list[Encoded]:
             encoded = self.encode({**request, "questions": dict(items)})

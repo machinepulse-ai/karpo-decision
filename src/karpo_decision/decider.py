@@ -100,7 +100,11 @@ class Decider:
 
     @torch.inference_mode()
     def logits(self, sequences: Sequence[Encoded]) -> list[list[torch.Tensor]]:
-        """Per sequence, each question's logits over its options (CPU, float32)."""
+        """Per sequence, each question's logits over its options (CPU, float32). Planned images get their pixels here
+        (``Vision.read``), for this pass only."""
+        vision = getattr(self.encoder.processor, "vision", None)
+        if vision is not None:
+            sequences = vision.read(sequences)
         hidden = self.model(pack(sequences, self.ckpt.backbone, self.device))
         flat = self.readout(hidden).cpu()
         out, cursor = [], 0

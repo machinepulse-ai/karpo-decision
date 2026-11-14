@@ -1,5 +1,6 @@
 """``pack`` lays the image tensors of its sequences end to end, in sequence order; none without images."""
 
+import pytest
 import torch
 
 from karpo_decision.encoding import Encoded
@@ -23,3 +24,10 @@ def test_pack_lays_image_tensors_end_to_end_in_sequence_order():
 def test_a_pack_without_images_has_none():
     p = pack([sequence(0), sequence(0)], None, torch.device("cpu"))
     assert p.pixel_values is None and p.image_position_ids is None
+
+
+def test_a_sequence_with_planned_images_and_no_pixels_is_refused():
+    """A plan's images get their pixels from ``Vision.read``; packing without them would read the placeholders."""
+    planned = Encoded(**{**sequence(0).__dict__, "images": ("planned",)})
+    with pytest.raises(ValueError, match="Vision.read"):
+        pack([planned], None, torch.device("cpu"))

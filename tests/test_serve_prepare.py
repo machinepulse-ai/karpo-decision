@@ -3,8 +3,14 @@ request's are made while one runs, and at most ``PREPARED_AHEAD`` requests hold 
 
 import threading
 import time
+import types
+
+import pytest
 
 from karpo_decision.serve import server
+
+#: How long a test waits for a thread before calling it stuck, and how long it lets a blocked thread show itself.
+WAIT_SECONDS, SETTLE_SECONDS = 10.0, 0.2
 
 
 class Decider:
@@ -17,11 +23,11 @@ class Decider:
         return plan
 
     def decide(self, request, plans):
-        self.gate.wait(10)
+        self.gate.wait(WAIT_SECONDS)
         return {"answers": {}, "usage": {"input_tokens": 0}}
 
 
-def until(condition, seconds=10.0):
+def until(condition, seconds=WAIT_SECONDS):
     end = time.monotonic() + seconds
     while not condition() and time.monotonic() < end:
         time.sleep(0.01)
@@ -42,10 +48,38 @@ def test_the_next_request_prepares_while_one_runs_and_no_more(monkeypatch):
     for thread in rest:
         thread.start()
     assert until(lambda: len(decider.prepared) == server.PREPARED_AHEAD)
-    time.sleep(0.2)
+    time.sleep(SETTLE_SECONDS)
     assert len(decider.prepared) == server.PREPARED_AHEAD  # the third waits for a free slot before preparing
     assert decider.prepared[1][1]  # the second prepared while the first held the GPU lock
     gate.set()
     for thread in (first, *rest):
-        thread.join(10)
+        thread.join(WAIT_SECONDS)
     assert sorted(request for request, _ in decider.prepared) == [0, 1, 2]
+
+
+def test_the_other_ranks_get_the_plan_and_the_gpu_the_prepared_one(monkeypatch):
+    """Prepared pixels are not pickled for the other ranks, which read their own."""
+    sent, decided = [], []
+    monkeypatch.setattr(server.torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(server.dist, "broadcast_object_list", lambda box, **kwargs: sent.append(box[0][1]))
+    decider = types.SimpleNamespace(prepare=lambda plan: ["prepared", *plan],
+                                    decide=lambda request, plans: decided.append(plans[0]) or {})
+    server.Ranks(decider, None, "cpu").run({}, ["plan"])
+    assert sent == [["plan"]] and decided == [["prepared", "plan"]]
+
+
+def test_a_failing_prepare_frees_its_slot(monkeypatch):
+    def prepare(plan):
+        raise ValueError("an image planned at 9 soft tokens has 8")
+
+    ranks = server.Ranks(types.SimpleNamespace(prepare=prepare), None, "cpu")
+
+    def fail_more_than_the_slots():
+        for _ in range(server.PREPARED_AHEAD + 1):
+            with pytest.raises(ValueError):
+                ranks.run({}, ["plan"])
+
+    thread = threading.Thread(target=fail_more_than_the_slots)
+    thread.start()
+    thread.join(WAIT_SECONDS)
+    assert not thread.is_alive()  # a slot kept by a failure would block the last call

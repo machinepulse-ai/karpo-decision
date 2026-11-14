@@ -168,13 +168,13 @@ class Ranks:
         """The response and the milliseconds spent handing the plan to the other ranks. The plan's first pack gets
         its pixels before the GPU lock, so they are made while the GPU runs the request before it."""
         with self.ahead:
-            plan = self.decider.prepare(plan)
+            prepared = self.decider.prepare(plan)
             with self.lock:
                 torch.cuda.set_device(self.device)
                 start = time.perf_counter()
-                dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)
+                dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)  # they read their own pixels
                 shared = (time.perf_counter() - start) * 1000
-                return self.decider.decide({"state": None, "questions": questions}, plans=[plan]), shared
+                return self.decider.decide({"state": None, "questions": questions}, plans=[prepared]), shared
 
     def follow(self) -> None:
         while True:

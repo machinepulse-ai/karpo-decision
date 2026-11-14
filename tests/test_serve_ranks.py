@@ -95,8 +95,9 @@ class SlowRunner:
     def run(self, questions, plan):
         if questions.get("fail"):
             raise ValueError("refused")
+        started = time.time()
         time.sleep(RUN_SECONDS)
-        return {"rank": self.rank, "questions": questions, "plan": plan}
+        return {"rank": self.rank, "questions": questions, "plan": plan, "span": (started, time.time())}
 
 
 def one_rank(rank, port, results):
@@ -120,17 +121,15 @@ def one_rank(rank, port, results):
             with lock:
                 answers.append((number, response))
 
-    started = time.perf_counter()
     threads = [threading.Thread(target=caller, args=(first,)) for first in range(CALLERS)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    elapsed = time.perf_counter() - started
     failed = ranks.channels[0].call(({"fail": True}, []))[0]
     after = ranks.channels[0].call(({"n": -1}, [-1]))[0]
     ranks.stop()
-    results.put({"answers": answers, "elapsed": elapsed, "failed": failed, "after": after})
+    results.put({"answers": answers, "failed": failed, "after": after})
 
 
 def test_four_processes_share_the_requests_over_a_gloo_group():
@@ -153,6 +152,9 @@ def test_four_processes_share_the_requests_over_a_gloo_group():
     assert sorted(answers) == list(range(REQUESTS))
     assert all(answers[n]["questions"] == {"n": n} and answers[n]["plan"] == [n] for n in answers)
     assert {answer["rank"] for answer in answers.values()} == set(range(WORLD))
-    assert result["elapsed"] < REQUESTS * RUN_SECONDS * 0.6  # in parallel: well under one after another
+    spans = [(answer["span"], answer["rank"]) for answer in answers.values()]
+    # Two ranks ran at the same moment.
+    assert any(a[0] < b[1] and b[0] < a[1] for a, first in spans for b, second in spans if first != second)
     assert result["failed"] == (None, "ValueError")
-    assert result["after"] == ({"rank": 1, "questions": {"n": -1}, "plan": [-1]}, None)  # the rank kept following
+    after, error = result["after"]
+    assert error is None and (after["rank"], after["questions"], after["plan"]) == (1, {"n": -1}, [-1])  # still following

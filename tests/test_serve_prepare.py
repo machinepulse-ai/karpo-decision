@@ -1,4 +1,4 @@
-"""``Ranks.run`` gives a request's first pack its pixels (``Decider.prepare``) before the GPU is free: the next
+"""``Runner.run`` gives a request's first pack its pixels (``Decider.prepare``) before the GPU is free: the next
 request's are made while one runs, and at most ``PREPARED_AHEAD`` requests hold prepared pixels."""
 
 import threading
@@ -36,10 +36,9 @@ def until(condition, seconds=WAIT_SECONDS):
 
 def test_the_next_request_prepares_while_one_runs_and_no_more(monkeypatch):
     monkeypatch.setattr(server.torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(server.dist, "broadcast_object_list", lambda *args, **kwargs: None)
     lock, gate = [], threading.Event()
     decider = Decider(lock, gate)
-    ranks = server.Ranks(decider, None, "cpu")
+    ranks = server.Runner(decider, "cpu")
     lock.append(ranks.lock)
     first = threading.Thread(target=ranks.run, args=({}, [0]))
     first.start()
@@ -57,22 +56,24 @@ def test_the_next_request_prepares_while_one_runs_and_no_more(monkeypatch):
     assert sorted(request for request, _ in decider.prepared) == [0, 1, 2]
 
 
-def test_the_other_ranks_get_the_plan_and_the_gpu_the_prepared_one(monkeypatch):
-    """Prepared pixels are not pickled for the other ranks, which read their own."""
+def test_another_rank_gets_the_plan_and_the_gpu_the_prepared_one(monkeypatch):
+    """Prepared pixels are not pickled for another rank, which reads its own."""
     sent, decided = [], []
     monkeypatch.setattr(server.torch.cuda, "set_device", lambda device: None)
-    monkeypatch.setattr(server.dist, "broadcast_object_list", lambda box, **kwargs: sent.append(box[0][1]))
     decider = types.SimpleNamespace(prepare=lambda plan: ["prepared", *plan],
                                     decide=lambda request, plans: decided.append(plans[0]) or {})
-    server.Ranks(decider, None, "cpu").run({}, ["plan"])
-    assert sent == [["plan"]] and decided == [["prepared", "plan"]]
+    channel = types.SimpleNamespace(call=lambda message: (sent.append(message[1]) or ({}, None), 0.0))
+    ranks = server.Ranks(server.Runner(decider, "cpu"), [channel])
+    ranks.run({}, ["plan"])  # here, on slot 0
+    ranks.run({}, ["plan"])  # on the other rank
+    assert decided == [["prepared", "plan"]] and sent == [["plan"]]
 
 
 def test_a_failing_prepare_frees_its_slot(monkeypatch):
     def prepare(plan):
         raise ValueError("an image planned at 9 soft tokens has 8")
 
-    ranks = server.Ranks(types.SimpleNamespace(prepare=prepare), None, "cpu")
+    ranks = server.Runner(types.SimpleNamespace(prepare=prepare), "cpu")
 
     def fail_more_than_the_slots():
         for _ in range(server.PREPARED_AHEAD + 1):

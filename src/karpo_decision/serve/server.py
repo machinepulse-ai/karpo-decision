@@ -1,4 +1,4 @@
-"""System One over HTTP for a decision checkpoint, under torchrun on one GPU.
+"""System One over HTTP for a decision checkpoint, under torchrun, on one GPU or one copy per GPU.
 
     torchrun --nproc_per_node 1 -m karpo_decision.serve.server --checkpoint path/to/checkpoint --port 18440
 
@@ -9,14 +9,16 @@ body after its ``request`` JSON part), as ``image_url`` parts with data URLs any
 screenshot at ``state.viewport_screenshot`` and ``images`` (data URLs). A body may be compressed with one
 Content-Encoding (gzip, x-gzip or zstd) and is at most ``MAX_BODY_BYTES`` compressed and decompressed (413; another
 encoding 415). Rank 0 encodes each request, so one outside the contract or with a question too long for the model gets
-422, and a body, image or asset it cannot read gets 400, without reaching the other ranks; it hands the encoded
-sequences to them over a CPU (gloo) group, and every rank runs the same passes, one request at a time; a request's
-first pack gets its image pixels while the GPU runs the request before it (``Decider.prepare``, ``PREPARED_AHEAD``).
-The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers)
-times in milliseconds. Each request is logged as one JSON line without content.
+422, and a body, image or asset it cannot read gets 400, without reaching the other ranks. Every rank loads the
+checkpoint on its own GPU and runs one request at a time: with ``--nproc_per_node N``, rank 0 runs each request on the
+rank with the fewest in flight, itself included, handing the encoded sequences to that rank over a CPU (gloo) group of
+the two and getting the answers back the same way; it listens once every rank has loaded. A request's first pack gets
+its image pixels, on the rank that runs it, while that rank's GPU runs the request before it (``Decider.prepare``,
+``PREPARED_AHEAD``). The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes,
+readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
 
-A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, warmed up with a text request for a
-block layout and a screenshot for a Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
+A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
+Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
 ``families/gemma/vision.py``) and Qwen3.5 read images, and the 12B reads text only. The opt-in paths combine and are
 refused by ``serve.paths`` at startup for a backbone that does not run them: ``--fp8`` runs the decoder projections in
 FP8 (Gemma: ``serve.fp8``; Qwen3.5: ``serve.qwen_fp8``); ``--graphs`` replays CUDA graphs captured at load (Gemma:
@@ -74,7 +76,14 @@ SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
 SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
 #: Requests whose first pack has its pixels before the GPU is free (``Decider.prepare``): the one running and the next.
 PREPARED_AHEAD = 2
-#: What rank 0 sends the other ranks when the server stops.
+#: The ranks pass requests and answers to each other on the CPU.
+CHANNEL_BACKEND = "gloo"
+#: A rank waits on its channel between requests for as long as the server is idle: the default 30-minute timeout
+#: would end it after the first quiet half hour.
+CHANNEL_TIMEOUT = datetime.timedelta(days=3650)
+#: What a rank sends rank 0 once it has loaded and warmed up.
+READY = "ready"
+#: What rank 0 sends a rank when the server stops.
 STOP = None
 
 
@@ -104,7 +113,7 @@ def warmup_request(checkpoint: str) -> Request:
     return screenshot_request()
 
 
-def load_decider(checkpoint: str, world: int, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
+def load_decider(checkpoint: str, device: torch.device, max_length: int = DEFAULT_MAX_LENGTH,
                  fp8: bool = False, triton_attention: bool = False, graphs: bool = False) -> tuple[Decider, Request]:
     """The ``Decider``, reading sequences of up to ``max_length`` tokens, and the request that warms it up, on one
     GPU. ``fp8``: the decoder projections in FP8. ``triton_attention``: the global layers' attention in one Triton
@@ -113,8 +122,6 @@ def load_decider(checkpoint: str, world: int, device: torch.device, max_length: 
     ``blackwell`` extra's kernels; Qwen3.5: any request read as one sequence, several questions or a screenshot
     included, up to min(``max_length``, 65,536) tokens, captured after compiling the layers, minutes); other passes
     run without the graphs. A path the backbone does not run is refused before loading (``serve.paths``)."""
-    if world != 1:
-        raise ValueError(f"a checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     require(checkpoint, fp8=fp8, triton_attention=triton_attention, graphs=graphs)
     qwen = backbone_type(checkpoint) == QWEN
     decider = Decider.from_pretrained(checkpoint, device=device, max_length=max_length)
@@ -150,41 +157,109 @@ def check_images(request: Request) -> None:
             raise AssetError("an image must be a data:image/... URL")
 
 
-class Ranks:
-    """Runs one request on every rank of the group, rank 0 deciding what runs."""
+class Runner:
+    """Runs one request at a time on this rank's GPU."""
 
-    def __init__(self, decider: Decider, control: dist.ProcessGroup, device: torch.device) -> None:
-        self.decider, self.control, self.device = decider, control, device
+    def __init__(self, decider: Decider, device: torch.device) -> None:
+        self.decider, self.device = decider, device
         self.lock = threading.Lock()
         self.ahead = threading.Semaphore(PREPARED_AHEAD)
 
-    def run(self, questions: dict[str, Any], plan: list[Encoded]) -> tuple[dict[str, Any], float]:
-        """The response and the milliseconds spent handing the plan to the other ranks. The plan's first pack gets
-        its pixels before the GPU lock, so they are made while the GPU runs the request before it."""
+    def run(self, questions: dict[str, Any], plan: list[Encoded]) -> dict[str, Any]:
+        """The plan's first pack gets its pixels before the GPU lock, so they are made while the GPU runs the request
+        before it."""
         with self.ahead:
             prepared = self.decider.prepare(plan)
             with self.lock:
                 torch.cuda.set_device(self.device)
-                start = time.perf_counter()
-                dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)  # they read their own pixels
-                shared = (time.perf_counter() - start) * 1000
-                return self.decider.decide({"state": None, "questions": questions}, plans=[prepared]), shared
+                return self.decider.decide({"state": None, "questions": questions}, plans=[prepared])
 
-    def follow(self) -> None:
-        while True:
-            box: list[Any] = [None]
-            dist.broadcast_object_list(box, src=0, group=self.control)
-            if box[0] is STOP:
-                return
-            questions, plan = box[0]
-            try:
-                self.decider.decide({"state": None, "questions": questions}, plans=[plan])
-            except Exception as error:  # noqa: BLE001 - rank 0 reports the failure; this rank keeps following
-                log(event="follower_error", error=type(error).__name__)
+
+class Channel:
+    """Rank 0's line to one other rank, a two-member group of the process group: one request at a time."""
+
+    def __init__(self, group: dist.ProcessGroup, rank: int) -> None:
+        self.group, self.rank = group, rank
+        self.lock = threading.Lock()
+
+    def send(self, message: Any) -> None:
+        dist.broadcast_object_list([message], src=0, group=self.group)
+
+    def receive(self) -> Any:
+        box: list[Any] = [None]
+        dist.broadcast_object_list(box, src=self.rank, group=self.group)
+        return box[0]
+
+    def call(self, message: Any) -> tuple[Any, float]:
+        """The rank's reply, and the milliseconds spent handing the message over."""
+        with self.lock:
+            start = time.perf_counter()
+            self.send(message)
+            shared = (time.perf_counter() - start) * 1000
+            return self.receive(), shared
+
+
+class Ranks:
+    """Rank 0 runs each request on the rank with the fewest in flight, itself included (slot 0), ties in turn."""
+
+    def __init__(self, runner: Runner, channels: list[Channel]) -> None:
+        self.runner, self.channels = runner, channels
+        self.decider = runner.decider
+        self.busy = [0] * (len(channels) + 1)
+        self.turn = 0
+        self.lock = threading.Lock()
+
+    def pick(self) -> int:
+        with self.lock:
+            count = len(self.busy)
+            slot = min(range(count), key=lambda r: (self.busy[r], (r - self.turn) % count))
+            self.busy[slot] += 1
+            self.turn = (slot + 1) % count
+            return slot
+
+    def done(self, slot: int) -> None:
+        with self.lock:
+            self.busy[slot] -= 1
+
+    def run(self, questions: dict[str, Any], plan: list[Encoded]) -> tuple[dict[str, Any], float]:
+        """The response and the milliseconds spent handing the plan to the rank that ran it."""
+        slot = self.pick()
+        try:
+            if slot == 0:
+                return self.runner.run(questions, plan), 0.0
+            (response, error), shared = self.channels[slot - 1].call((questions, plan))
+            if error:
+                raise RuntimeError(f"rank {slot}: {error}")
+            return response, shared
+        finally:
+            self.done(slot)
+
+    def ready(self) -> None:
+        """Returns once every other rank has loaded and warmed up."""
+        for channel in self.channels:
+            channel.receive()
 
     def stop(self) -> None:
-        with self.lock:
-            dist.broadcast_object_list([STOP], src=0, group=self.control)
+        for channel in self.channels:
+            with channel.lock:
+                channel.send(STOP)
+
+
+def follow(runner: Any, group: dist.ProcessGroup, rank: int) -> None:
+    """A rank other than 0: tells rank 0 it is ready, then runs what rank 0 hands it until the server stops."""
+    dist.broadcast_object_list([READY], src=rank, group=group)
+    while True:
+        box: list[Any] = [None]
+        dist.broadcast_object_list(box, src=0, group=group)
+        if box[0] is STOP:
+            return
+        questions, plan = box[0]
+        try:
+            reply = (runner.run(questions, plan), None)
+        except Exception as error:  # noqa: BLE001 - rank 0 answers 500; this rank keeps following
+            log(event="follower_error", error=type(error).__name__)
+            reply = (None, type(error).__name__)
+        dist.broadcast_object_list([reply], src=rank, group=group)
 
 
 class Server(ThreadingHTTPServer):
@@ -309,20 +384,22 @@ def main() -> None:
     local = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local)
     torch.cuda.set_device(device)
-    dist.init_process_group("nccl", device_id=device)
+    dist.init_process_group(CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
     rank, world = dist.get_rank(), dist.get_world_size()
-    # The other ranks wait on this group between requests for as long as the server is idle: the default 30-minute
-    # timeout would end them after the first quiet half hour.
-    control = dist.new_group(backend="gloo", timeout=datetime.timedelta(days=3650))
+    # One channel per other rank; every rank creates all of them, in the same order.
+    groups = [dist.new_group([0, other], backend=CHANNEL_BACKEND, timeout=CHANNEL_TIMEOUT)
+              for other in range(1, world)]
     started = time.time()
-    decider, warmup = load_decider(args.checkpoint, world, device, args.max_length, fp8=args.fp8,
+    decider, warmup = load_decider(args.checkpoint, device, args.max_length, fp8=args.fp8,
                                    triton_attention=args.triton_attention, graphs=args.graphs)
     loaded = time.time()
     decider.decide(warmup)
-    ranks = Ranks(decider, control, device)
+    runner = Runner(decider, device)
     if rank != 0:
-        ranks.follow()
+        follow(runner, groups[rank - 1], rank)
         os._exit(0)
+    ranks = Ranks(runner, [Channel(group, other) for other, group in enumerate(groups, start=1)])
+    ranks.ready()
     info = {"ranks": world, "gpu": torch.cuda.get_device_name(device), "attention": decider.config.attention,
             "path": path_name(args.fp8, isinstance(decider.model, (gemma_graphs.Graphs, qwen_graphs.CudaGraphs))),
             "kernels": ["triton-attention"] if args.triton_attention else [], "max_length": decider.max_length}
@@ -337,7 +414,7 @@ def main() -> None:
     server.shutdown()
     server.server_close()
     ranks.stop()
-    # The process just ends, without tearing the NCCL group down.
+    # The process just ends, without tearing the process group down.
     os._exit(0)
 
 

@@ -1,4 +1,4 @@
-"""Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on one GPU, plain by default, FP8
+"""Which path ``serve.server`` loads a checkpoint through: a Gemma 4 checkpoint on its rank's GPU, plain by default, FP8
 projections with ``fp8``, ``triton_attention`` after the quantization, CUDA graphs last with ``graphs``, warmed up
 with the graphs' warmup request (text only). A Qwen3.5 checkpoint warms up with a screenshot and runs FP8 and CUDA
 graphs through its own modules. How it reads its ``--max-length``, and that ``--no-fast`` is gone. No GPU and no
@@ -24,22 +24,15 @@ def checkpoint(directory, model_type, template="karpo-blocks-v1"):
     return str(directory)
 
 
-def test_gemma_serves_on_one_gpu_through_the_plain_path(tmp_path, monkeypatch):
+def test_gemma_serves_through_the_plain_path(tmp_path, monkeypatch):
     path = checkpoint(tmp_path, "gemma4")
     calls = []
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: calls.append((directory, device))
                                     or "plain"))
-    decider, warmup = server.load_decider(path, 1, "cuda:0")
+    decider, warmup = server.load_decider(path, "cuda:0")
     assert decider == "plain" and calls == [(path, "cuda:0")]
     assert warmup is server.graphs.WARMUP_REQUEST and images_of(warmup)[1] == []
-
-
-def test_gemma_refuses_more_than_one_gpu(tmp_path, monkeypatch):
-    path = checkpoint(tmp_path, "gemma4")
-    monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
-    with pytest.raises(ValueError, match="one GPU"):
-        server.load_decider(path, 2, "cuda:0")
 
 
 def test_fp8_quantizes_the_decoder_projections_and_captures_no_graphs(tmp_path, monkeypatch):
@@ -50,7 +43,7 @@ def test_fp8_quantizes_the_decoder_projections_and_captures_no_graphs(tmp_path, 
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda model: quantized.append(model))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
-    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", fp8=True)[0] is decider
     assert quantized == ["packed"]
 
 
@@ -62,7 +55,7 @@ def test_fp8_with_graphs_quantizes_then_captures(tmp_path, monkeypatch):
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda model: calls.append(("fp8", model)))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
-    assert server.load_decider(path, 1, "cuda:0", fp8=True, graphs=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", fp8=True, graphs=True)[0] is decider
     assert calls == [("fp8", "packed"), ("fast", decider)]
 
 
@@ -74,7 +67,7 @@ def test_gemma_graphs_capture_on_the_bf16_path(tmp_path, monkeypatch):
                         classmethod(lambda cls, directory, device="cuda", **_: decider))
     monkeypatch.setattr(server, "quantize", lambda *_: pytest.fail("quantized"))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
-    assert server.load_decider(path, 1, "cuda:0", graphs=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", graphs=True)[0] is decider
     assert calls == [("fast", decider)]
 
 
@@ -83,7 +76,7 @@ def test_the_plain_path_captures_no_graphs(tmp_path, monkeypatch):
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: "plain"))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
-    assert server.load_decider(path, 1, "cuda:0")[0] == "plain"
+    assert server.load_decider(path, "cuda:0")[0] == "plain"
 
 
 def test_triton_attention_comes_after_the_quantization_and_before_the_graphs(tmp_path, monkeypatch):
@@ -96,7 +89,7 @@ def test_triton_attention_comes_after_the_quantization_and_before_the_graphs(tmp
     monkeypatch.setattr(server, "enable_attention",
                         lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
-    assert server.load_decider(path, 1, "cuda:0", fp8=True, triton_attention=True, graphs=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", fp8=True, triton_attention=True, graphs=True)[0] is decider
     assert calls == [("fp8", "packed"), ("attention", "packed", DEFAULT_MAX_LENGTH), ("fast", decider)]
 
 
@@ -109,7 +102,7 @@ def test_triton_attention_without_fp8(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "enable_attention",
                         lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda *_: pytest.fail("captured"))
-    assert server.load_decider(path, 1, "cuda:0", 65_536, triton_attention=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", 65_536, triton_attention=True)[0] is decider
     assert calls == [("attention", "packed", 65_536)]
 
 
@@ -123,7 +116,7 @@ def test_gemma_graphs_come_after_triton_attention_on_the_bf16_path(tmp_path, mon
     monkeypatch.setattr(server, "enable_attention",
                         lambda model, max_length: calls.append(("attention", model, max_length)))
     monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
-    assert server.load_decider(path, 1, "cuda:0", triton_attention=True, graphs=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", triton_attention=True, graphs=True)[0] is decider
     assert calls == [("attention", "packed", DEFAULT_MAX_LENGTH), ("fast", decider)]
 
 
@@ -133,8 +126,8 @@ def test_gemma_reads_sequences_as_long_as_the_server_is_told(tmp_path, monkeypat
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", max_length=None, **_:
                                     lengths.append(max_length) or "plain"))
-    server.load_decider(path, 1, "cuda:0")
-    server.load_decider(path, 1, "cuda:0", 65_536)
+    server.load_decider(path, "cuda:0")
+    server.load_decider(path, "cuda:0", 65_536)
     assert lengths == [DEFAULT_MAX_LENGTH, 65_536]
 
 
@@ -155,9 +148,9 @@ def test_a_path_the_backbone_does_not_run_is_refused_before_loading(tmp_path, mo
     path = checkpoint(tmp_path, "llama")
     monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="fp8 is not supported for llama checkpoints"):
-        server.load_decider(path, 1, "cuda:0", fp8=True)
+        server.load_decider(path, "cuda:0", fp8=True)
     with pytest.raises(ValueError, match="graphs is not supported for llama checkpoints"):
-        server.load_decider(path, 1, "cuda:0", graphs=True)
+        server.load_decider(path, "cuda:0", graphs=True)
 
 
 def test_qwen_warms_up_with_a_screenshot(tmp_path, monkeypatch):
@@ -165,7 +158,7 @@ def test_qwen_warms_up_with_a_screenshot(tmp_path, monkeypatch):
     path = checkpoint(tmp_path, "qwen3_5", template=QWEN_TEMPLATE)
     monkeypatch.setattr(server.Decider, "from_pretrained",
                         classmethod(lambda cls, directory, device="cuda", **_: "plain"))
-    decider, warmup = server.load_decider(path, 1, "cuda:0")
+    decider, warmup = server.load_decider(path, "cuda:0")
     assert decider == "plain" and len(images_of(warmup)[1]) == 1
 
 
@@ -173,7 +166,7 @@ def test_qwen_refuses_triton_attention(tmp_path, monkeypatch):
     path = checkpoint(tmp_path, "qwen3_5", template=QWEN_TEMPLATE)
     monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="triton_attention is not supported for qwen3_5 checkpoints"):
-        server.load_decider(path, 1, "cuda:0", triton_attention=True)
+        server.load_decider(path, "cuda:0", triton_attention=True)
 
 
 def qwen_calls(tmp_path, monkeypatch):
@@ -188,25 +181,25 @@ def qwen_calls(tmp_path, monkeypatch):
 
 def test_qwen_graphs_capture_without_quantizing(tmp_path, monkeypatch):
     path, decider, calls = qwen_calls(tmp_path, monkeypatch)
-    assert server.load_decider(path, 1, "cuda:0", graphs=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", graphs=True)[0] is decider
     assert calls == [("graphs", decider)]
 
 
 def test_qwen_fp8_with_graphs_quantizes_then_captures_once(tmp_path, monkeypatch):
     path, decider, calls = qwen_calls(tmp_path, monkeypatch)
-    server.load_decider(path, 1, "cuda:0", fp8=True, graphs=True)
+    server.load_decider(path, "cuda:0", fp8=True, graphs=True)
     assert calls == [("fp8", "packed"), ("graphs", decider)]
 
 
 def test_qwen_fp8_only_quantizes(tmp_path, monkeypatch):
     path, decider, calls = qwen_calls(tmp_path, monkeypatch)
-    assert server.load_decider(path, 1, "cuda:0", fp8=True)[0] is decider
+    assert server.load_decider(path, "cuda:0", fp8=True)[0] is decider
     assert calls == [("fp8", "packed")]
 
 
 def test_qwen_plain_captures_nothing(tmp_path, monkeypatch):
     path, decider, calls = qwen_calls(tmp_path, monkeypatch)
-    server.load_decider(path, 1, "cuda:0")
+    server.load_decider(path, "cuda:0")
     assert calls == []
 
 
@@ -219,3 +212,14 @@ def test_the_server_no_longer_takes_no_fast(capsys):
     with pytest.raises(SystemExit):
         server.arguments(["--checkpoint", "c", "--fp8", "--no-fast"])
     assert "unrecognized arguments: --no-fast" in capsys.readouterr().err
+
+
+def test_runner_runs_one_request_on_its_device(monkeypatch):
+    devices = []
+    monkeypatch.setattr(server.torch.cuda, "set_device", devices.append)
+    decider = types.SimpleNamespace(prepare=lambda plan: plan,
+                                    decide=lambda request, plans: {"request": request, "plans": plans})
+    runner = server.Runner(decider, "cuda:3")
+    assert runner.run({"q": {}}, ["sequence"]) == {"request": {"state": None, "questions": {"q": {}}},
+                                                    "plans": [["sequence"]]}
+    assert devices == ["cuda:3"]

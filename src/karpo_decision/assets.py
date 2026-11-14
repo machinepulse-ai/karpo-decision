@@ -10,12 +10,13 @@ asset must be referenced. An image part is a dict of type ``image_url`` whose ``
 
 from __future__ import annotations
 
-import base64
 import binascii
 import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+import pybase64
 
 from .protocol import (
     ASSETS,
@@ -127,7 +128,7 @@ def _image_bytes(key: str, asset: dict[str, Any]) -> bytes:
     if isinstance(asset.get(DATA), bytes):
         return asset[DATA]
     try:
-        return base64.b64decode("".join(asset[DATA_BASE64].split()), validate=True)
+        return pybase64.b64decode("".join(asset[DATA_BASE64].split()), validate=True)
     except (binascii.Error, ValueError) as error:
         raise AssetError(f"Asset {key!r}: data_base64 is not base64") from error
 

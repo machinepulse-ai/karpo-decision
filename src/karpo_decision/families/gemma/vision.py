@@ -89,11 +89,12 @@ class Vision:
 
     def read(self, sequences: Sequence[Encoded]) -> list[Encoded]:
         """``sequences`` with the pixels of their planned images (``Encoded.images``): each image prepared on its own
-        (``prepare``) and laid out in row order, a value several images share prepared once."""
+        (``prepare``) and laid out in row order, a value several images share prepared once; a sequence that has its
+        pixels already (``Decider.prepare``) is kept as it is."""
         prepared: dict[int, Images] = {}
         out = []
         for s in sequences:
-            if not s.images:
+            if not s.images or s.pixel_values is not None:
                 out.append(s)
                 continue
             parts = []

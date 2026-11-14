@@ -37,11 +37,12 @@ def decider():
      ({"fp8": True, "graphs": True}, True, "fp8-graphs", ["quantize", "decide", "fast"], []),
      ({"fp8": True, "graphs": True}, False, "fp8", ["quantize", "decide", "fast"], []),
      ({"triton_attention": True}, True, "plain", ["attention"], ["triton-attention"]),
+     ({"fp8": True, "triton_attention": True}, True, "fp8", ["quantize", "attention", "decide"], ["triton-attention"]),
      ({"graphs": True, "triton_attention": True}, True, "graphs", ["attention", "fast"], ["triton-attention"]),
      ({"fp8": True, "graphs": True, "triton_attention": True}, True, "fp8-graphs",
       ["quantize", "attention", "decide", "fast"], ["triton-attention"])],
     ids=["bf16", "graphs", "graphs-not-applicable", "fp8", "fp8-graphs", "fp8-graphs-not-applicable",
-         "bf16-triton-attention", "graphs-triton-attention", "fp8-graphs-triton-attention"])
+         "bf16-triton-attention", "fp8-triton-attention", "graphs-triton-attention", "fp8-graphs-triton-attention"])
 def test_engine_path(monkeypatch, options, applies, path, called, kernels):
     monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset({"fp8", "graphs", "triton_attention"}))
     calls, loaded = [], decider()
@@ -82,6 +83,21 @@ def test_engine_refuses_a_path_the_backbone_does_not_run(monkeypatch):
                         classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="not supported"):
         engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True)
+
+
+def test_engine_asks_require_for_every_opt_in_path(monkeypatch):
+    asked = []
+
+    def refuse(checkpoint, **options):
+        asked.append(options)
+        raise ValueError("graphs is not supported for llama checkpoints")
+
+    monkeypatch.setattr(engine, "require", refuse)
+    monkeypatch.setattr(engine.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, **_: pytest.fail("loaded")))
+    with pytest.raises(ValueError, match="graphs is not supported"):
+        engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu", fp8=True, graphs=True)
+    assert asked == [{"fp8": True, "triton_attention": False, "graphs": True}]
 
 
 def vision_decider(tokens=63):

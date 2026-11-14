@@ -113,6 +113,20 @@ def test_triton_attention_without_fp8(tmp_path, monkeypatch):
     assert calls == [("attention", "packed", 65_536)]
 
 
+def test_gemma_graphs_come_after_triton_attention_on_the_bf16_path(tmp_path, monkeypatch):
+    path = checkpoint(tmp_path, "gemma4")
+    decider = types.SimpleNamespace(model="packed")
+    calls = []
+    monkeypatch.setattr(server.Decider, "from_pretrained",
+                        classmethod(lambda cls, directory, device="cuda", **_: decider))
+    monkeypatch.setattr(server, "quantize", lambda *_: pytest.fail("quantized"))
+    monkeypatch.setattr(server, "enable_attention",
+                        lambda model, max_length: calls.append(("attention", model, max_length)))
+    monkeypatch.setattr(server.graphs, "fast", lambda d: calls.append(("fast", d)) or True)
+    assert server.load_decider(path, 1, "cuda:0", triton_attention=True, graphs=True)[0] is decider
+    assert calls == [("attention", "packed", DEFAULT_MAX_LENGTH), ("fast", decider)]
+
+
 def test_gemma_reads_sequences_as_long_as_the_server_is_told(tmp_path, monkeypatch):
     path = checkpoint(tmp_path, "gemma4")
     lengths = []
@@ -142,6 +156,8 @@ def test_a_path_the_backbone_does_not_run_is_refused_before_loading(tmp_path, mo
     monkeypatch.setattr(server.Decider, "from_pretrained", classmethod(lambda *_, **__: pytest.fail("loaded")))
     with pytest.raises(ValueError, match="fp8 is not supported for llama checkpoints"):
         server.load_decider(path, 1, "cuda:0", fp8=True)
+    with pytest.raises(ValueError, match="graphs is not supported for llama checkpoints"):
+        server.load_decider(path, 1, "cuda:0", graphs=True)
 
 
 def test_qwen_warms_up_with_a_screenshot(tmp_path, monkeypatch):

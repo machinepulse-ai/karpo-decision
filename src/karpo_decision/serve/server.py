@@ -10,9 +10,10 @@ screenshot at ``state.viewport_screenshot`` and ``images`` (data URLs). A body m
 Content-Encoding (gzip, x-gzip or zstd) and is at most ``MAX_BODY_BYTES`` compressed and decompressed (413; another
 encoding 415). Rank 0 encodes each request, so one outside the contract or with a question too long for the model gets
 422, and a body, image or asset it cannot read gets 400, without reaching the other ranks; it hands the encoded
-sequences to them over a CPU (gloo) group, and every rank runs the same passes, one request at a time. The
-``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers) times
-in milliseconds. Each request is logged as one JSON line without content.
+sequences to them over a CPU (gloo) group, and every rank runs the same passes, one request at a time; a request's
+first pack gets its image pixels while the GPU runs the request before it (``Decider.prepare``, ``PREPARED_AHEAD``).
+The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers)
+times in milliseconds. Each request is logged as one JSON line without content.
 
 A checkpoint serves on one GPU (``--nproc_per_node 1``) through the ``Decider``, warmed up with a text request for a
 block layout and a screenshot for a Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
@@ -72,6 +73,8 @@ SCREENSHOT_WARMUP_GREY = (200, 200, 200)
 SCREENSHOT_WARMUP_JPEG_QUALITY = 75
 SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
 SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
+#: Requests whose first pack has its pixels before the GPU is free (``Decider.prepare``): the one running and the next.
+PREPARED_AHEAD = 2
 #: What rank 0 sends the other ranks when the server stops.
 STOP = None
 
@@ -159,15 +162,19 @@ class Ranks:
     def __init__(self, decider: Decider, control: dist.ProcessGroup, device: torch.device) -> None:
         self.decider, self.control, self.device = decider, control, device
         self.lock = threading.Lock()
+        self.ahead = threading.Semaphore(PREPARED_AHEAD)
 
     def run(self, questions: dict[str, Any], plan: list[Encoded]) -> tuple[dict[str, Any], float]:
-        """The response and the milliseconds spent handing the plan to the other ranks."""
-        with self.lock:
-            torch.cuda.set_device(self.device)
-            start = time.perf_counter()
-            dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)
-            shared = (time.perf_counter() - start) * 1000
-            return self.decider.decide({"state": None, "questions": questions}, plans=[plan]), shared
+        """The response and the milliseconds spent handing the plan to the other ranks. The plan's first pack gets
+        its pixels before the GPU lock, so they are made while the GPU runs the request before it."""
+        with self.ahead:
+            plan = self.decider.prepare(plan)
+            with self.lock:
+                torch.cuda.set_device(self.device)
+                start = time.perf_counter()
+                dist.broadcast_object_list([(questions, plan)], src=0, group=self.control)
+                shared = (time.perf_counter() - start) * 1000
+                return self.decider.decide({"state": None, "questions": questions}, plans=[plan]), shared
 
     def follow(self) -> None:
         while True:

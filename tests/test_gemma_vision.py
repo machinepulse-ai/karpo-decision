@@ -188,3 +188,11 @@ def test_vision_of_reads_the_checkpoints_config(tmp_path, config, reads_images):
     assert (found is not None) == reads_images
     if reads_images:
         assert found.tokens == vision.ImageTokens(begin=7, soft=8, end=9)
+
+
+def test_read_keeps_a_sequence_whose_pixels_are_ready(monkeypatch):
+    """``Decider.prepare`` reads a request's first pack ahead; its pack then reads only the rest."""
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
+    (ready,) = v.read([sequence_with(v.measure(Image.new("RGB", (640, 480))))])
+    monkeypatch.setattr(vision.Vision, "prepare", lambda self, values: pytest.fail("prepared twice"))
+    assert v.read([ready])[0] is ready

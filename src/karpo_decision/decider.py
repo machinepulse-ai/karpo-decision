@@ -49,6 +49,15 @@ class Decider:
         ``max_length``. Raises ``RequestError`` outside the contract and ``LengthError`` when a question cannot fit."""
         return self.encoder.plan(request, self.max_length)
 
+    def prepare(self, plan: list[Encoded]) -> list[Encoded]:
+        """``plan`` with the pixels of the images its first pack reads (``Vision.read``), the rest left to their own
+        packs: a server prepares one request's first pack while the GPU runs another."""
+        vision = getattr(self.encoder.processor, "vision", None)
+        if vision is None:
+            return plan
+        first = len(next(self._packs(list(enumerate(plan))), []))
+        return vision.read(plan[:first]) + plan[first:]
+
     def decide(self, requests: Request | Sequence[Request],
                plans: Sequence[list[Encoded]] | None = None) -> dict[str, Any] | list[dict[str, Any]]:
         """One response per request (``{"answers": {...}, "usage": {...}}``), in input order. ``plans``, when given,

@@ -19,13 +19,18 @@ from transformers.models.gemma4.configuration_gemma4 import (  # noqa: E402
 )
 from transformers.models.gemma4.modeling_gemma4 import Gemma4Model  # noqa: E402
 
-from karpo_decision.encoding import Encoded, open_image  # noqa: E402
+from karpo_decision.encoding import Encoded, ImageError, open_image  # noqa: E402
 from karpo_decision.families import gemma  # noqa: E402
 from karpo_decision.families.gemma import vision  # noqa: E402
 
 TOKENS = vision.ImageTokens(begin=290, soft=291, end=292)
 #: The smallest budget Gemma 4's processor takes: images of at most 70 soft tokens keep the CPU tests fast.
 SMALL = 70
+#: How far apart, in grey levels, the torchvision and Pillow processors may put a pixel: rounding on smooth images, and
+#: on average on random noise, where the two resamplers overshoot differently.
+SMOOTH_ROUNDING_LEVELS = 2
+NOISE_MEAN_LEVELS = 1
+GREY_LEVELS = 255
 
 
 def tiny_backbone(window: int, types=("sliding_attention", "full_attention"), *, hidden: int = 32,
@@ -98,7 +103,7 @@ def test_measure_counts_the_soft_tokens_the_processor_makes(budget):
         assert v.measure(picture).tokens == v.prepare([picture]).tokens[0], size
 
 
-def test_measure_reads_bytes_data_urls_and_paths_whole(tmp_path):
+def test_measure_reads_bytes_data_urls_and_paths_from_their_header(tmp_path):
     v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
     picture = Image.new("RGB", (300, 900), (10, 200, 30))
     path = tmp_path / "tall.png"
@@ -107,8 +112,19 @@ def test_measure_reads_bytes_data_urls_and_paths_whole(tmp_path):
     raw = base64.b64decode(url.partition(",")[2])
     want = v.prepare([picture]).tokens[0]
     assert [v.measure(value).tokens for value in (raw, url, str(path))] == [want] * 3
-    with pytest.raises((ValueError, OSError)):
-        v.measure(raw[: len(raw) // 2])  # its header reads, its pixels do not
+    assert v.measure(url).value == raw  # the plan keeps the data URL's bytes
+
+
+def test_an_image_whose_pixels_do_not_decode_measures_and_fails_in_prepare():
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL)
+    picture = Image.new("RGB", (300, 900), (10, 200, 30))
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    truncated = buffer.getvalue()[: len(buffer.getvalue()) // 2]
+    planned = v.measure(truncated)  # its header reads
+    assert planned.tokens == v.measure(picture).tokens
+    with pytest.raises(ImageError, match="does not decode"):
+        v.prepare([planned.value])
 
 
 def sequence_with(*images):
@@ -196,3 +212,24 @@ def test_read_keeps_a_sequence_whose_pixels_are_ready(monkeypatch):
     (ready,) = v.read([sequence_with(v.measure(Image.new("RGB", (640, 480))))])
     monkeypatch.setattr(vision.Vision, "prepare", lambda self, values: pytest.fail("prepared twice"))
     assert v.read([ready])[0] is ready
+
+
+def test_the_processor_matches_transformers_pillow_processor():
+    """The torchvision processor in use against Transformers' Pillow one: the same patches, pixels apart by rounding on
+    a gradient, and on average on noise."""
+    from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+
+    v, pillow = vision.Vision(TOKENS, max_soft_tokens=SMALL), Gemma4ImageProcessorPil(max_soft_tokens=SMALL)
+    generator = torch.Generator().manual_seed(0)
+    for width, height in [(640, 480), (300, 900), (47, 49), (1568, 1568)]:
+        x = torch.arange(width).view(1, -1).expand(height, width) * 255 // max(width - 1, 1)
+        y = torch.arange(height).view(-1, 1).expand(height, width) * 255 // max(height - 1, 1)
+        gradient = Image.fromarray(torch.stack([x, y, (x + y) // 2], -1).to(torch.uint8).numpy())
+        noise = Image.fromarray(torch.randint(0, 256, (height, width, 3), generator=generator,
+                                              dtype=torch.uint8).numpy())
+        for picture, bound, reduce in ((gradient, SMOOTH_ROUNDING_LEVELS, torch.amax),
+                                       (noise, NOISE_MEAN_LEVELS, torch.mean)):
+            got, want = v.prepare([picture]), pillow(images=[picture], return_tensors="pt")
+            assert torch.equal(got.position_ids, want["image_position_ids"]), (width, height)
+            levels = ((got.pixel_values - want["pixel_values"]).abs() * GREY_LEVELS).round()
+            assert reduce(levels) <= bound, (width, height)

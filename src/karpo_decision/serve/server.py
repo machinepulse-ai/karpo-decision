@@ -9,7 +9,8 @@ body after its ``request`` JSON part), as ``image_url`` parts with data URLs any
 screenshot at ``state.viewport_screenshot`` and ``images`` (data URLs). A body may be compressed with one
 Content-Encoding (gzip, x-gzip or zstd) and is at most ``MAX_BODY_BYTES`` compressed and decompressed (413; another
 encoding 415). Rank 0 encodes each request, so one outside the contract or with a question too long for the model gets
-422, and a body, image or asset it cannot read gets 400, without reaching the other ranks. Every rank loads the
+422, and a body, image or asset it cannot read gets 400, without reaching the other ranks; an image is read there from
+its header only, and one whose pixels then do not decode gets 400 from the rank that runs it. Every rank loads the
 checkpoint on its own GPU and runs one request at a time: with ``--nproc_per_node N``, rank 0 runs each request on the
 rank with the fewest in flight, itself included, handing the encoded sequences to that rank over a CPU (gloo) group of
 the two and getting the answers back the same way; it listens once every rank has loaded. A request's first pack gets
@@ -54,7 +55,7 @@ import torch.distributed as dist
 from ..assets import AssetError
 from ..config import DecisionConfig
 from ..decider import DEFAULT_MAX_LENGTH, Decider
-from ..encoding import Encoded, LengthError
+from ..encoding import Encoded, ImageError, LengthError
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..families.qwen import MODEL_TYPE as QWEN
 from ..protocol import ASSETS, IMAGE_DATA_URL, IMAGE_URL, VIEWPORT_SCREENSHOT, Request, RequestError, images_of
@@ -229,7 +230,10 @@ class Ranks:
                 return self.runner.run(questions, plan), 0.0
             (response, error), shared = self.channels[slot - 1].call((questions, plan))
             if error:
-                raise RuntimeError(f"rank {slot}: {error}")
+                name, message = error
+                if name == ImageError.__name__:  # an image of the request does not decode: its fault, a 400
+                    raise ImageError(message)
+                raise RuntimeError(f"rank {slot}: {name}")
             return response, shared
         finally:
             self.done(slot)
@@ -256,9 +260,9 @@ def follow(runner: Any, group: dist.ProcessGroup, rank: int) -> None:
         questions, plan = box[0]
         try:
             reply = (runner.run(questions, plan), None)
-        except Exception as error:  # noqa: BLE001 - rank 0 answers 500; this rank keeps following
+        except Exception as error:  # noqa: BLE001 - rank 0 answers for it; this rank keeps following
             log(event="follower_error", error=type(error).__name__)
-            reply = (None, type(error).__name__)
+            reply = (None, (type(error).__name__, str(error)))
         dist.broadcast_object_list([reply], src=rank, group=group)
 
 
@@ -344,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
         running = time.perf_counter()
         try:
             response, shared = self.server.ranks.run(request["questions"], plan)
+        except ImageError as error:  # an image whose pixels do not decode, found when its pack was prepared
+            return self._error(400, str(error))
         except Exception as error:  # noqa: BLE001 - one failed request must not stop the server
             log(event="request", status=500, error=type(error).__name__)
             return self._send(500, {"error": {"message": "inference failed"}})

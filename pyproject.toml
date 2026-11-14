@@ -14,13 +14,15 @@ dependencies = [
     "torch>=2.14",          # torch.nn.attention.varlen with window_size and enable_gqa
     "transformers>=5.17",   # Gemma 4 (gemma4, gemma4_unified) and Qwen3.5 (qwen3_5) backbones
     "safetensors>=0.6",
-    "pillow>=11",           # images: encoding.open_image, Gemma 4's image processor
+    "pillow>=11",           # images: encoding.open_image
+    "torchvision>=0.29",    # the Gemma 4 and Qwen3.5 image processors
+    "pybase64>=1.4",        # images in data URLs and assets
     "backports.zstd>=1.0; python_version < '3.14'",  # zstd request bodies (serve.wire), standard from Python 3.14
 ]
 
 [project.optional-dependencies]
-# Qwen3.5 checkpoints: the linear-attention kernels and the image processor.
-qwen = ["flash-linear-attention>=0.5.2", "torchvision>=0.29"]
+# Qwen3.5 checkpoints: the linear-attention kernels.
+qwen = ["flash-linear-attention>=0.5.2"]
 # Gemma's attention kernels on Blackwell: cuDNN's FROST engines (global layers, head size 512) and flash-attention 4
 # (sliding layers, head size 256, its generic d256 backward); without them the memory-efficient / FA2 paths serve.
 blackwell = ["nvidia-cudnn-frontend==1.32.1", "nvidia-cutlass-dsl==4.8.1", "apache-tvm-ffi==0.1.15.post2",

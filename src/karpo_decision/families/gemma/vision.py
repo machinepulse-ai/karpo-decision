@@ -1,9 +1,10 @@
 """Images for a Gemma 4 checkpoint with a vision tower (the 31B): each image as Gemma 4's image processor prepares it
 (at most ``MAX_SOFT_TOKENS`` soft tokens) and the soft-token embeddings the backbone's pretrained vision tower makes of
-it. A plan holds each image as it came with its soft tokens, counted from its size alone (``Vision.measure``); its
-pixels are prepared only when its sequences are packed (``Vision.read``) and dropped after the pass. ``blocks.py`` lays
-the soft tokens out; ``packed.py`` writes the embeddings at their rows and lets each image's soft tokens see their
-whole image in the sliding layers (Gemma 4 reads an image bidirectionally)."""
+it. A plan holds each image as it came (a data URL as its bytes) with its soft tokens, counted from its size alone, read
+from its header (``Vision.measure``); its pixels are decoded once, only when its sequences are packed
+(``Vision.read``), and dropped after the pass. ``blocks.py`` lays the soft tokens out; ``packed.py`` writes the
+embeddings at their rows and lets each image's soft tokens see their whole image in the sliding layers (Gemma 4 reads an
+image bidirectionally)."""
 
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ...encoding import Encoded, open_image
+from ...encoding import Encoded, ImageError, image_bytes, image_size, open_image
 
 #: Soft tokens per image at most (Gemma 4's processor takes 70, 140, 280, 560 or 1120): 5,040 patches of 16 x 16
 #: pixels pooled 3 x 3, about 1.29 MP.
@@ -50,28 +51,36 @@ class Images:
     tokens: tuple[int, ...]  # soft tokens per image
 
 
+def decode(value: Any) -> Any:
+    """``value``'s pixels as a PIL image (``encoding.open_image``); ``ImageError`` when they do not decode."""
+    try:
+        return open_image(value)
+    except (ValueError, OSError) as error:
+        raise ImageError(f"an image does not decode: {error}") from error
+
+
 class Vision:
     """Image preparation for a checkpoint whose backbone has a vision tower."""
 
     def __init__(self, tokens: ImageTokens, max_soft_tokens: int = MAX_SOFT_TOKENS) -> None:
-        from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+        from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
 
         self.tokens = tokens
-        self.processor = Gemma4ImageProcessorPil(max_soft_tokens=max_soft_tokens)
+        self.processor = Gemma4ImageProcessor(max_soft_tokens=max_soft_tokens)
 
     def _valid(self, position_ids: torch.Tensor) -> torch.Tensor:
         return (position_ids != PADDING).all(-1).sum(-1)
 
     def prepare(self, values: Sequence[Any]) -> Images:
-        """``values``: PIL images, image file bytes, data URLs or file paths (``encoding.open_image``)."""
-        out = self.processor(images=[open_image(value) for value in values], return_tensors="pt")
+        """``values``: PIL images, image file bytes, data URLs or file paths, each decoded once (``decode``)."""
+        out = self.processor(images=[decode(value) for value in values], return_tensors="pt")
         pooled = self._valid(out["image_position_ids"]) // self.processor.pooling_kernel_size ** 2
         return Images(out["pixel_values"], out["image_position_ids"], tuple(int(n) for n in pooled))
 
     def soft_tokens(self, height: int, width: int) -> int:
         """Soft tokens of an image of ``height`` x ``width`` pixels: the processor's own resize target (Transformers'
         ``get_aspect_ratio_preserving_size``) in patches, pooled."""
-        from transformers.models.gemma4.image_processing_pil_gemma4 import get_aspect_ratio_preserving_size
+        from transformers.models.gemma4.image_processing_gemma4 import get_aspect_ratio_preserving_size
 
         patch, pool = self.processor.patch_size, self.processor.pooling_kernel_size
         h, w = get_aspect_ratio_preserving_size(height=height, width=width, patch_size=patch,
@@ -80,11 +89,11 @@ class Vision:
         return (h // patch) * (w // patch) // pool ** 2
 
     def measure(self, value: Any) -> PlannedImage:
-        """``value`` read whole once, so an image that does not decode fails before any pass (a PIL image is read
-        already), and its soft tokens from its size; its pixels are not kept."""
-        from PIL import Image
-
-        width, height = value.size if isinstance(value, Image.Image) else open_image(value).size
+        """``value``'s soft tokens from its size, read from its header alone (``encoding.image_size``): what is not an
+        image, or a decompression bomb, fails here, before any pass; its pixels are decoded once, by ``prepare``. A data
+        URL is kept as its bytes."""
+        value = image_bytes(value)
+        width, height = image_size(value)
         return PlannedImage(value, self.soft_tokens(height, width))
 
     def read(self, sequences: Sequence[Encoded]) -> list[Encoded]:

@@ -9,12 +9,12 @@ any forward pass: a single question that does not fit fails the whole request in
 
 from __future__ import annotations
 
-import base64
 import io
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import pybase64
 import torch
 
 from .protocol import IMAGE_DATA_URL, Question, Request, describe, images_of, options, validate
@@ -36,6 +36,10 @@ class TextOnlyError(ValueError):
 class PlacementError(ValueError):
     """The request has inline images (``assets.py``) and this checkpoint's joint layout (Qwen3.5) reads images only
     before the text: the screenshot and ``images``."""
+
+
+class ImageError(ValueError):
+    """An image whose header reads (``image_size``) and whose pixels do not decode: truncated or corrupt data."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,28 @@ class Encoded:
         return int(self.input_ids.numel())
 
 
+def image_bytes(value: Any) -> Any:
+    """``value`` as a plan keeps it: a data URL as its bytes (its base64 read once), anything else unchanged."""
+    if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
+        return pybase64.b64decode(value.partition(",")[2], validate=True)
+    return value
+
+
+def image_size(value: Any) -> tuple[int, int]:
+    """(width, height) of an image, image file bytes, a data URL or a file path, read from the header alone: no pixel
+    is decoded. ``OSError`` for what is not an image, ``ValueError`` for a decompression bomb (as ``open_image``)."""
+    from PIL import Image
+
+    if isinstance(value, Image.Image):
+        return value.size
+    value = image_bytes(value)
+    try:
+        with Image.open(io.BytesIO(value) if isinstance(value, bytes) else value) as image:
+            return image.size
+    except Image.DecompressionBombError as error:
+        raise ValueError(str(error)) from error
+
+
 def open_image(value: Any) -> Any:
     """A PIL image from image file bytes, a data URL, a file path or an image; ValueError or OSError when it does not
     decode (PIL's decompression bomb error is neither, so it becomes a ValueError)."""
@@ -75,14 +101,9 @@ def open_image(value: Any) -> Any:
 
     if isinstance(value, Image.Image):
         return value.convert("RGB")
+    value = image_bytes(value)
     try:
-        if isinstance(value, bytes):
-            with Image.open(io.BytesIO(value)) as image:
-                return image.convert("RGB")
-        if isinstance(value, str) and value.startswith(IMAGE_DATA_URL):
-            with Image.open(io.BytesIO(base64.b64decode(value.partition(",")[2], validate=True))) as image:
-                return image.convert("RGB")
-        with Image.open(value) as image:
+        with Image.open(io.BytesIO(value) if isinstance(value, bytes) else value) as image:
             return image.convert("RGB")
     except Image.DecompressionBombError as error:
         raise ValueError(str(error)) from error

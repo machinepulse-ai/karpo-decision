@@ -34,7 +34,7 @@ from decision_index.engines import Engine, Unsupported
 
 from ..assets import AssetError
 from ..decider import DEFAULT_MAX_LENGTH, Decider
-from ..encoding import LengthError, PlacementError, TextOnlyError
+from ..encoding import ImageError, LengthError, PlacementError, TextOnlyError
 from ..families.gemma import vision
 from ..families.gemma.triton_attention import enable as enable_attention
 from ..families.qwen import MODEL_TYPE as QWEN
@@ -106,7 +106,11 @@ class DecisionIndexEngine(Engine):
         except (RequestError, LengthError, TextOnlyError, AssetError, PlacementError, OSError) as error:
             raise Unsupported(f"{type(error).__name__}: {error}") from error
         self.last_encode_ms = (time.perf_counter() - start) * 1000
-        response = {"model": self.name, **joined(request, self.decider.decide(readings, plans), self.view)}
+        try:
+            decided = self.decider.decide(readings, plans)
+        except ImageError as error:
+            raise Unsupported(f"{type(error).__name__}: {error}") from error
+        response = {"model": self.name, **joined(request, decided, self.view)}
         if not images or self.vision is None:
             return response, None
         pixels, tokens = self.vision.summary(plans[0][0].images)

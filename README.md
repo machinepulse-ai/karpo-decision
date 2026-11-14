@@ -106,8 +106,8 @@ included:
 
 - `assets`: images by key, `{"<key>": {"type": "image", "format": "png", "data_base64": "..."}}`, the key written in a
   string of the state, of a question's `instructions` or of its `criteria`, whole or inside text. In a
-  `multipart/form-data` body the `request` JSON part comes first and each asset names its part,
-  `{"type": "image", "part": "asset-0"}`.
+  `multipart/form-data` body (RFC 7578: CRLF line breaks, no Content-Transfer-Encoding) the `request` JSON part comes
+  first and each asset names its part, `{"type": "image", "part": "asset-0"}`.
 - `image_url` parts with a `data:image/...` URL anywhere in the state, the instructions or the criteria.
 - An image sits where it is referenced: in the state text, or in its question's branch, where the shared list of
   questions shows `[image]`; each reference is one copy. `state.viewport_screenshot` (unless it holds an asset key)

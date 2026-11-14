@@ -2,9 +2,9 @@
 (at most ``MAX_SOFT_TOKENS`` soft tokens) and the soft-token embeddings the backbone's pretrained vision tower makes of
 it. A plan holds each image as it came (a data URL as its bytes) with its soft tokens, counted from its size alone, read
 from its header (``Vision.measure``); its pixels are decoded once, only when its sequences are packed
-(``Vision.read``), and dropped after the pass. ``blocks.py`` lays
-the soft tokens out; ``packed.py`` writes the embeddings at their rows and lets each image's soft tokens see their
-whole image in the sliding layers (Gemma 4 reads an image bidirectionally)."""
+(``Vision.read``), and dropped after the pass. ``blocks.py`` lays the soft tokens out; ``packed.py`` writes the
+embeddings at their rows and lets each image's soft tokens see their whole image in the sliding layers (Gemma 4 reads an
+image bidirectionally)."""
 
 from __future__ import annotations
 

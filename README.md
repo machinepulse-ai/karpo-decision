@@ -62,13 +62,13 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 ```
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
-`--fp8` runs on every checkpoint; `--triton-attention` on the Gemma checkpoints; `--graphs` (CUDA graphs on the bf16
-path, captured at startup) on the Qwen3.5 checkpoints.
-`--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise) and replays CUDA graphs captured
-at startup (a few minutes; the layers are compiled first on Qwen3.5). Gemma: single-question text-only requests up to
-the Gemma graphs' limit, not with the `blackwell` extra's kernels. Qwen3.5: any request read as one sequence (several
-questions or a screenshot included) up to min(`--max-length`, 65,536) tokens. Other passes run the plain path.
-`--no-fast` with `--fp8` skips the graphs (ignored with `--graphs`).
+`--fp8` and `--graphs` run on every checkpoint, alone or together; `--triton-attention` on the Gemma checkpoints.
+`--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise); without `--graphs` it is slower
+than the plain path on the Qwen3.5 checkpoints.
+`--graphs` replays CUDA graphs captured at startup (2-7 minutes; the layers are compiled first on Qwen3.5). Gemma:
+single-question text-only requests up to the Gemma graphs' limit, not with the `blackwell` extra's kernels. Qwen3.5:
+any request read as one sequence (several questions or a screenshot included) up to min(`--max-length`, 65,536)
+tokens. Other passes run without the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
@@ -85,19 +85,20 @@ docker run --gpus all -v <checkpoint dir>:/checkpoint -p 18440:18440 karpo-decis
 
 ### Opt-in paths by checkpoint
 
-Same top answer as the plain path, and latency per request (median / mean), one request at a time on one GPU, over
-2,215 Decision Index requests:
+Same top answer as the plain path, and latency per request once the kernels are compiled (median / mean), one request
+at a time on one GPU, over 2,215 Decision Index requests:
 
-| Checkpoint | Plain | `--graphs` | `--fp8` | `--triton-attention` |
-|---|---|---|---|---|
-| 12B | 55 / 213 ms | | 99.1%, 30 / 146 ms | 99.8%, 47 / 185 ms |
-| 9B | 70 / 144 ms | 99.9%, 31 / 147 ms | 99.5%, 21 / 104 ms | |
-| 4B | 53 / 189 ms | 99.9%, 19 / 101 ms | 99.5%, 14 / 77 ms | |
-| 2B | 43 / 64 ms | 99.9%, 11 / 54 ms | 99.3%, 9 / 46 ms | |
-| 0.8B | 41 / 138 ms | 99.9%, 8 / 44 ms | 99.0%, 8 / 42 ms | |
+| Checkpoint | Plain | `--graphs` | `--fp8` | `--fp8 --graphs` | `--triton-attention` |
+|---|---|---|---|---|---|
+| 31B | 114 / 510 ms | 100.0%, 114 / 509 ms | 99.4%, 82 / 367 ms | 99.4%, 77 / 354 ms | 99.8%, 114 / 460 ms |
+| 12B | 57 / 214 ms | 99.9%, 46 / 204 ms | 99.1%, 61 / 166 ms | 99.1%, 31 / 147 ms | 99.9%, 54 / 190 ms |
+| 9B | 71 / 155 ms | 99.9%, 31 / 130 ms | 99.6%, 106 / 192 ms | 99.5%, 21 / 93 ms | |
+| 4B | 72 / 123 ms | 99.9%, 19 / 87 ms | 99.5%, 108 / 166 ms | 99.5%, 14 / 68 ms | |
+| 2B | 52 / 72 ms | 99.9%, 11 / 41 ms | 99.2%, 82 / 105 ms | 99.3%, 9 / 34 ms | |
+| 0.8B | 53 / 65 ms | 99.9%, 8 / 31 ms | 99.1%, 79 / 93 ms | 99.0%, 8 / 27 ms | |
 
-`--fp8` includes the CUDA graphs; with `--no-fast` it is slower than the plain path on the Qwen3.5 checkpoints.
-Capturing the graphs takes 2-4 minutes at startup.
+On the Qwen3.5 checkpoints kernels compile on first use: in a first pass over these requests the mean latency was up
+to 2.7x higher.
 
 ## TypeSafe System One compatibility
 
@@ -129,8 +130,7 @@ python -m decision_index run --engine karpo_decision.serve.engine:DecisionIndexE
     --option checkpoint=<checkpoint dir> --out runs/karpo-decision-31B
 ```
 
-`--option fp8=true` runs the FP8 path of `--fp8`, graphs included (`--option fast=false` without them;
-ignored with `graphs=true`).
+`--option fp8=true` is `--fp8`.
 `--option triton_attention=true` is `--triton-attention`.
 `--option graphs=true` is `--graphs`.
 `--option image_root=<dir>` is the directory the vision suite's image references are relative to.

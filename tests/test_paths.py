@@ -32,6 +32,8 @@ def test_an_unlisted_backbone_runs_none(tmp_path):
         paths.require(path, fp8=True)
     with pytest.raises(ValueError, match="triton_attention is not supported for llama checkpoints"):
         paths.require(path, triton_attention=True)
+    with pytest.raises(ValueError, match="graphs is not supported for llama checkpoints"):
+        paths.require(path, graphs=True)
 
 
 def test_an_untrained_checkpoint_reads_its_backbone_directory(tmp_path):
@@ -46,12 +48,11 @@ def test_an_untrained_checkpoint_reads_its_backbone_directory(tmp_path):
 
 
 def test_qwen_runs_fp8_and_graphs():
-    assert paths.PATHS["qwen3_5"] == {paths.FP8, paths.GRAPHS, paths.BF16_GRAPHS}
+    assert paths.PATHS["qwen3_5"] == {paths.FP8, paths.GRAPHS}
 
 
-def test_bf16_graphs_are_qwen_only(tmp_path):
-    with pytest.raises(ValueError, match="graphs is not supported for gemma4 checkpoints"):
-        paths.require(checkpoint(tmp_path, "gemma4"), graphs=True)
+def test_gemma_runs_graphs_alone(tmp_path):
+    assert paths.GRAPHS in paths.require(checkpoint(tmp_path, "gemma4"), graphs=True)
 
 
 def test_path_names():

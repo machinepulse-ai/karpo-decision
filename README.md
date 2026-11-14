@@ -62,11 +62,12 @@ torchrun --standalone --nproc_per_node 1 -m karpo_decision.serve.server --checkp
 
 It listens on `127.0.0.1` by default and has no authentication or TLS of its own.
 `--fp8` and `--graphs` run on every checkpoint, alone or together; `--triton-attention` on the Gemma checkpoints.
-`--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise).
-`--graphs` replays CUDA graphs captured at startup (a few minutes; the layers are compiled first on Qwen3.5). Gemma:
+`--fp8` runs the decoder projections in FP8 (answers move by more than bf16 noise); without `--graphs` it is slower
+than the plain path on the Qwen3.5 checkpoints.
+`--graphs` replays CUDA graphs captured at startup (2-7 minutes; the layers are compiled first on Qwen3.5). Gemma:
 single-question text-only requests up to the Gemma graphs' limit, not with the `blackwell` extra's kernels. Qwen3.5:
 any request read as one sequence (several questions or a screenshot included) up to min(`--max-length`, 65,536)
-tokens. Other passes run the plain path.
+tokens. Other passes run without the graphs.
 `--triton-attention` runs the global layers' attention in one Triton kernel on sm_120 GPUs, twice as fast; requests of
 16k-32k tokens take 1.2-1.4x less time (answers move by bf16 noise).
 
@@ -95,7 +96,8 @@ at a time on one GPU, over 2,215 Decision Index requests:
 | 2B | 52 / 72 ms | 99.9%, 11 / 41 ms | 99.2%, 82 / 105 ms | 99.3%, 9 / 34 ms | |
 | 0.8B | 53 / 65 ms | 99.9%, 8 / 31 ms | 99.1%, 79 / 93 ms | 99.0%, 8 / 27 ms | |
 
-Capturing the graphs takes 2-7 minutes at startup.
+On the Qwen3.5 checkpoints kernels compile on first use: in a first pass over these requests the mean latency was up
+to 2.7x higher.
 
 ## Decision Index
 

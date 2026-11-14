@@ -17,7 +17,7 @@ refused by ``serve.paths`` at startup for a backbone that does not run them: ``-
 FP8 (Gemma: ``serve.fp8``; Qwen3.5: ``serve.qwen_fp8``); ``--graphs`` replays CUDA graphs captured at load (Gemma:
 single-question text-only requests up to the graphs' limit, ``serve.graphs``, not with the ``blackwell`` extra's
 kernels; Qwen3.5: any request read as one sequence up to min(``--max-length``, 65,536) tokens, ``serve.qwen_graphs``,
-captured after compiling the layers; other passes run the plain path); ``--triton-attention`` runs Gemma's global
+captured after compiling the layers; other passes run without the graphs); ``--triton-attention`` runs Gemma's global
 layers' attention in one Triton kernel (sm_120 GPUs).
 
 ``--max-length`` is the longest sequence in tokens (default ``DEFAULT_MAX_LENGTH``; with ``--triton-attention`` the
@@ -103,7 +103,7 @@ def load_decider(checkpoint: str, world: int, device: torch.device, max_length: 
     ``fp8``, where they apply (Gemma: single-question text-only requests up to the graphs' limit, not with the
     ``blackwell`` extra's kernels; Qwen3.5: any request read as one sequence, several questions or a screenshot
     included, up to min(``max_length``, 65,536) tokens, captured after compiling the layers, minutes); other passes
-    run the plain path. A path the backbone does not run is refused before loading (``serve.paths``)."""
+    run without the graphs. A path the backbone does not run is refused before loading (``serve.paths``)."""
     if world != 1:
         raise ValueError(f"a checkpoint serves on one GPU (torchrun --nproc_per_node 1), not {world}")
     require(checkpoint, fp8=fp8, triton_attention=triton_attention, graphs=graphs)

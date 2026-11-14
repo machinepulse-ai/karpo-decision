@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("decision_index")
 from karpo_decision.assets import AssetError  # noqa: E402
-from karpo_decision.encoding import PlacementError, TextOnlyError  # noqa: E402
+from karpo_decision.encoding import ImageError, PlacementError, TextOnlyError  # noqa: E402
 from karpo_decision.serve import engine, paths  # noqa: E402
 
 GEMMA, QWEN = "gemma4", "qwen3_5"
@@ -144,6 +144,23 @@ def test_engine_answers_unsupported_for_an_image_it_cannot_read(monkeypatch):
     e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
     with pytest.raises(engine.Unsupported):
         e({}, {"q": {"type": "noul", "instructions": "Blank?"}}, images=["broken"])
+
+
+def test_engine_answers_unsupported_for_an_image_whose_pixels_do_not_decode(monkeypatch):
+    loaded = vision_decider()
+
+    def decide(readings, plans):
+        raise ImageError("an image does not decode: image file is truncated")
+
+    loaded.decide = decide
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset())
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    images_module = types.SimpleNamespace(MAX_PIXELS=1_638_400, pil=lambda ref, root, cap: ref)
+    monkeypatch.setitem(sys.modules, "decision_index.vision.images", images_module)
+    monkeypatch.setitem(sys.modules, "decision_index.vision", types.SimpleNamespace(images=images_module))
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
+    with pytest.raises(engine.Unsupported, match="ImageError"):
+        e({}, {"q": {"type": "noul", "instructions": "Blank?"}}, images=["img/0.png"])
 
 
 def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(monkeypatch):

@@ -10,6 +10,7 @@ import types
 
 import pytest
 
+from karpo_decision.encoding import ImageError
 from karpo_decision.serve import server
 
 LOOPBACK = "127.0.0.1"
@@ -30,7 +31,7 @@ class FakeRunner:
 
 
 class FakeChannel:
-    """Answers as its rank would: the response, or the error's name."""
+    """Answers as its rank would: the response, or the error's name and message."""
 
     def __init__(self, name, error=None):
         self.name, self.error, self.sent, self.lock = name, error, [], threading.Lock()
@@ -65,9 +66,18 @@ def test_requests_go_to_rank_0_and_to_the_other_ranks_in_turn():
 
 
 def test_a_rank_that_failed_raises_and_frees_its_slot():
-    ranks = server.Ranks(FakeRunner(), [FakeChannel("rank 1", error="OutOfMemoryError")])
+    ranks = server.Ranks(FakeRunner(), [FakeChannel("rank 1", error=("OutOfMemoryError", "CUDA out of memory"))])
     ranks.run({}, [])
     with pytest.raises(RuntimeError, match="rank 1: OutOfMemoryError"):
+        ranks.run({}, [])
+    assert ranks.busy == [0, 0]
+
+
+def test_an_image_another_rank_cannot_decode_is_an_image_error_here():
+    failure = (ImageError.__name__, "an image does not decode: image file is truncated")
+    ranks = server.Ranks(FakeRunner(), [FakeChannel("rank 1", error=failure)])
+    ranks.run({}, [])
+    with pytest.raises(ImageError, match="truncated"):
         ranks.run({}, [])
     assert ranks.busy == [0, 0]
 
@@ -95,6 +105,8 @@ class SlowRunner:
     def run(self, questions, plan):
         if questions.get("fail"):
             raise ValueError("refused")
+        if questions.get("image"):
+            raise ImageError("an image does not decode: image file is truncated")
         started = time.time()
         time.sleep(RUN_SECONDS)
         return {"rank": self.rank, "questions": questions, "plan": plan, "span": (started, time.time())}
@@ -127,9 +139,10 @@ def one_rank(rank, port, results):
     for thread in threads:
         thread.join()
     failed = ranks.channels[0].call(({"fail": True}, []))[0]
+    image = ranks.channels[0].call(({"image": True}, []))[0]
     after = ranks.channels[0].call(({"n": -1}, [-1]))[0]
     ranks.stop()
-    results.put({"answers": answers, "failed": failed, "after": after})
+    results.put({"answers": answers, "failed": failed, "image": image, "after": after})
 
 
 def test_four_processes_share_the_requests_over_a_gloo_group():
@@ -155,7 +168,8 @@ def test_four_processes_share_the_requests_over_a_gloo_group():
     spans = [(answer["span"], answer["rank"]) for answer in answers.values()]
     # Two ranks ran at the same moment.
     assert any(a[0] < b[1] and b[0] < a[1] for a, first in spans for b, second in spans if first != second)
-    assert result["failed"] == (None, "ValueError")
+    assert result["failed"] == (None, ("ValueError", "refused"))
+    assert result["image"] == (None, (ImageError.__name__, "an image does not decode: image file is truncated"))
     after, error = result["after"]
     # The rank kept following after its failure.
     assert error is None and (after["rank"], after["questions"], after["plan"]) == (1, {"n": -1}, [-1])

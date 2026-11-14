@@ -10,7 +10,7 @@ import threading
 import pytest
 
 from karpo_decision.assets import resolve
-from karpo_decision.encoding import LengthError
+from karpo_decision.encoding import ImageError, LengthError
 from karpo_decision.protocol import validate
 from karpo_decision.serve import server, wire
 
@@ -33,6 +33,10 @@ class FakeRanks:
     decider = FakeDecider()
 
     def run(self, questions, plan):
+        if "undecodable" in questions:
+            raise ImageError("an image does not decode: image file is truncated")
+        if "crash" in questions:
+            raise RuntimeError("rank 1: OutOfMemoryError")
         return {"answers": {key: {"answer": "A"} for key in questions}, "usage": {"input_tokens": 7}}, 0.0
 
 
@@ -100,6 +104,16 @@ def test_an_image_path_is_refused(post):
 def test_an_image_that_does_not_decode_is_a_bad_request(post):
     status, _ = post({"state": "", "questions": {"q": QUESTION}, "images": ["data:image/png;base64,broken"]})
     assert status == 400
+
+
+def test_an_image_whose_pixels_do_not_decode_when_it_runs_answers_400(post):
+    status, body = post({"state": "", "questions": {"undecodable": QUESTION}})
+    assert status == 400 and "does not decode" in body["error"]["message"]
+
+
+def test_any_other_failure_while_it_runs_answers_500(post):
+    status, body = post({"state": "", "questions": {"crash": QUESTION}})
+    assert status == 500 and body["error"]["message"] == "inference failed"
 
 
 ASSET = {"type": "image", "format": "png", "data_base64": "iVBORw0KGgo="}

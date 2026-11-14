@@ -1,6 +1,6 @@
 """``families.gemma.vision`` on CPU: images prepared from PIL images, data URLs and paths (soft tokens as Gemma 4's
-image processor counts them) and bad ones refused, embeddings from a tiny random vision tower, and which checkpoints get
-``vision``."""
+image processors count them) and bad ones refused, embeddings from a tiny random vision tower and a tiny 12B-shaped
+image embedder, and which checkpoints get ``vision``."""
 
 import base64
 import io
@@ -193,6 +193,8 @@ def test_embed_gives_one_row_per_soft_token_in_image_order():
 @pytest.mark.parametrize(("config", "reads_images"), [
     ({"model_type": "gemma4", "vision_config": {"model_type": "gemma4_vision"}, "boi_token_id": 7,
       "image_token_id": 8, "eoi_token_id": 9}, True),
+    ({"model_type": "gemma4_unified", "vision_config": {"model_type": "gemma4_unified_vision"}, "boi_token_id": 7,
+      "image_token_id": 8, "eoi_token_id": 9}, True),
     ({"model_type": "gemma4_unified", "vision_config": None, "boi_token_id": 7, "image_token_id": 8,
       "eoi_token_id": 9}, False),
     ({"model_type": "gemma4"}, False),
@@ -204,6 +206,8 @@ def test_vision_of_reads_the_checkpoints_config(tmp_path, config, reads_images):
     assert (found is not None) == reads_images
     if reads_images:
         assert found.tokens == vision.ImageTokens(begin=7, soft=8, end=9)
+        unified = config["model_type"] == gemma.UNIFIED_MODEL_TYPE
+        assert found.positions_per_token == (1 if unified else 9)
 
 
 def test_read_keeps_a_sequence_whose_pixels_are_ready(monkeypatch):
@@ -233,3 +237,41 @@ def test_the_processor_matches_transformers_pillow_processor():
             assert torch.equal(got.position_ids, want["image_position_ids"]), (width, height)
             levels = ((got.pixel_values - want["pixel_values"]).abs() * GREY_LEVELS).round()
             assert reduce(levels) <= bound, (width, height)
+
+
+def tiny_unified_backbone():
+    """A tiny random 12B-shaped Gemma 4 (``gemma4_unified``): no vision tower, an encoder-free image embedder."""
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import (
+        Gemma4UnifiedConfig,
+        Gemma4UnifiedTextConfig,
+        Gemma4UnifiedVisionConfig,
+    )
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedModel
+
+    torch.manual_seed(0)
+    text = Gemma4UnifiedTextConfig(vocab_size=300, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+                                   num_attention_heads=4, num_key_value_heads=2, head_dim=8, global_head_dim=16,
+                                   num_global_key_value_heads=1, attention_k_eq_v=True, sliding_window=128,
+                                   layer_types=["sliding_attention", "full_attention"], hidden_size_per_layer_input=0,
+                                   final_logit_softcapping=30.0)
+    embedder = Gemma4UnifiedVisionConfig(patch_size=16, pooling_kernel_size=3, mm_embed_dim=32, mm_posemb_size=64,
+                                         output_proj_dims=32)
+    config = Gemma4UnifiedConfig(text_config=text.to_dict(), vision_config=embedder.to_dict(), audio_config=None,
+                                 boi_token_id=TOKENS.begin, image_token_id=TOKENS.soft, eoi_token_id=TOKENS.end)
+    return Gemma4UnifiedModel(config).double().eval()
+
+
+def test_the_unified_processor_counts_one_position_per_soft_token():
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL, unified=True)
+    for size in SIZES:
+        picture = Image.new("RGB", size)
+        assert v.measure(picture).tokens == v.prepare([picture]).tokens[0], size
+
+
+def test_embed_reads_a_unified_backbones_image_embedder():
+    backbone = tiny_unified_backbone()
+    v = vision.Vision(TOKENS, max_soft_tokens=SMALL, unified=True)
+    images = v.prepare([Image.new("RGB", (640, 480), (200, 30, 30)), Image.new("RGB", (300, 900), (10, 200, 30))])
+    with torch.inference_mode():
+        rows = vision.embed(backbone, images.pixel_values, images.position_ids)
+    assert rows.shape == (sum(images.tokens), 32)

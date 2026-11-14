@@ -17,10 +17,10 @@ backbone does not run is refused before loading (``serve.paths``).
 
 A request outside the contract, with an image that cannot be read or that breaks a rule of placed images
 (``assets.py``), or with a question that does not fit ``max_length`` tokens with its state and images is
-``Unsupported``, and so is a request with images on the 12B, which reads text only.
-On the 31B a request with images (the vision suite) runs through the backbone's vision tower
-(``families/gemma/vision.py``) and its meta reports the images' pixels and soft tokens; a checkpoint without that Gemma
-vision unit returns meta None (Qwen3.5 reads images through its own layout).
+``Unsupported``, and so is a request with images on a checkpoint that reads text only.
+On a Gemma checkpoint a request with images (the vision suite) runs through ``families/gemma/vision.py`` and the
+backbone's vision tower (the 31B) or image embedder (the 12B), and its meta reports the images' pixels and soft tokens;
+a checkpoint without that Gemma vision unit returns meta None (Qwen3.5 reads images through its own layout).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ gemma_graphs = graphs
 class DecisionIndexEngine(Engine):
     name = "karpo-decision"
     latency = ("Device-synchronized in-process request wall time: prompt, tokenization and plan, the forward passes, "
-               "readout and answers (with images, also reading them and the vision tower); excludes loading, graph "
+               "readout and answers (with images, also reading and embedding them); excludes loading, graph "
                "capture and warmup.")
 
     def __init__(self, checkpoint: str, view: str = "joint", max_length: int = DEFAULT_MAX_LENGTH,
@@ -82,13 +82,16 @@ class DecisionIndexEngine(Engine):
         self.vision = getattr(decider.encoder.processor, "vision", None)
         self.path = path_name(fp8, bool(captured))
         self.kernels = ["triton-attention"] if triton_attention else []
+        images = None
+        if self.vision:
+            processor, reader = (("unified image processor", "image embedder") if self.vision.unified
+                                 else ("image processor", "vision tower"))
+            images = (f"Gemma 4's {processor} at {vision.MAX_SOFT_TOKENS} soft tokens per image at most, after the "
+                      f"kit's pixel cap; the backbone's {reader}; the soft tokens in the shared block, each image "
+                      "whole in the sliding layers")
         self.provenance = {"kind": "decision-checkpoint", "checkpoint": checkpoint, "path": self.path, "view": view,
                            "template": decider.config.template, "attention": decider.config.attention,
-                           "kernels": self.kernels,
-                           "images": (f"Gemma 4's image processor at {vision.MAX_SOFT_TOKENS} soft tokens per image "
-                                      "at most, after the kit's pixel cap; the backbone's vision tower; the soft "
-                                      "tokens in the shared block, each image whole in the sliding layers")
-                           if self.vision else None}
+                           "kernels": self.kernels, "images": images}
         #: Milliseconds the last request spent in encoding (template, tokenizer, plan).
         self.last_encode_ms = 0.0
 

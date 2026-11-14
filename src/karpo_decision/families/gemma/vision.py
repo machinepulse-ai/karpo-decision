@@ -1,10 +1,10 @@
-"""Images for a Gemma 4 checkpoint with a vision tower (the 31B): each image as Gemma 4's image processor prepares it
-(at most ``MAX_SOFT_TOKENS`` soft tokens) and the soft-token embeddings the backbone's pretrained vision tower makes of
-it. A plan holds each image as it came (a data URL as its bytes) with its soft tokens, counted from its size alone, read
-from its header (``Vision.measure``); its pixels are decoded once, only when its sequences are packed
-(``Vision.read``), and dropped after the pass. ``blocks.py`` lays the soft tokens out; ``packed.py`` writes the
-embeddings at their rows and lets each image's soft tokens see their whole image in the sliding layers (Gemma 4 reads an
-image bidirectionally)."""
+"""Images for a Gemma 4 checkpoint that reads them: each image as Gemma 4's image processor prepares it (at most
+``MAX_SOFT_TOKENS`` soft tokens) and the soft-token embeddings the backbone makes of it, with its pretrained vision
+tower (the 31B) or its encoder-free image embedder (the 12B, ``unified``). A plan holds each image as it came (a data
+URL as its bytes) with its soft tokens, counted from its size alone, read from its header (``Vision.measure``); its
+pixels are decoded once, only when its sequences are packed (``Vision.read``), and dropped after the pass.
+``blocks.py`` lays the soft tokens out; ``packed.py`` writes the embeddings at their rows and lets each image's soft
+tokens see their whole image in the sliding layers (Gemma 4 reads an image bidirectionally)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ from ...encoding import Encoded, ImageError, image_bytes, image_size, open_image
 #: pixels pooled 3 x 3, about 1.29 MP.
 MAX_SOFT_TOKENS = 560
 PADDING = -1  # position id of a padding patch
+#: Patch positions per soft token in the 12B's processor (``unified``): one per merged 48 x 48 patch; Gemma 4's
+#: processor gives one per 16 x 16 patch, pooled 3 x 3 into a soft token.
+UNIFIED_POSITIONS_PER_TOKEN = 1
 
 
 @dataclass(frozen=True)
@@ -44,9 +47,9 @@ class PlannedImage:
 
 @dataclass(frozen=True)
 class Images:
-    """A request's images as the vision tower reads them, on CPU."""
+    """A request's images as the backbone reads them, on CPU."""
 
-    pixel_values: torch.Tensor  # (n, patches, 3 x 16 x 16) float32, padded
+    pixel_values: torch.Tensor  # (n, patches, 3 x 16 x 16; merged 3 x 48 x 48 in the 12B's) float32, padded
     position_ids: torch.Tensor  # (n, patches, 2), -1 on padding
     tokens: tuple[int, ...]  # soft tokens per image
 
@@ -60,13 +63,21 @@ def decode(value: Any) -> Any:
 
 
 class Vision:
-    """Image preparation for a checkpoint whose backbone has a vision tower."""
+    """Image preparation for a checkpoint whose backbone reads images: the 31B's vision tower, or the 12B's
+    encoder-free image embedder (``unified``: Gemma 4's unified image processor, merged patches)."""
 
-    def __init__(self, tokens: ImageTokens, max_soft_tokens: int = MAX_SOFT_TOKENS) -> None:
-        from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
-
+    def __init__(self, tokens: ImageTokens, max_soft_tokens: int = MAX_SOFT_TOKENS, unified: bool = False) -> None:
+        if unified:
+            from transformers.models.gemma4_unified.image_processing_gemma4_unified import (
+                Gemma4UnifiedImageProcessor as Processor,
+            )
+        else:
+            from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor as Processor
         self.tokens = tokens
-        self.processor = Gemma4ImageProcessor(max_soft_tokens=max_soft_tokens)
+        self.unified = unified
+        self.processor = Processor(max_soft_tokens=max_soft_tokens)
+        self.positions_per_token = (UNIFIED_POSITIONS_PER_TOKEN if unified
+                                    else self.processor.pooling_kernel_size ** 2)
 
     def _valid(self, position_ids: torch.Tensor) -> torch.Tensor:
         return (position_ids != PADDING).all(-1).sum(-1)
@@ -74,12 +85,12 @@ class Vision:
     def prepare(self, values: Sequence[Any]) -> Images:
         """``values``: PIL images, image file bytes, data URLs or file paths, each decoded once (``decode``)."""
         out = self.processor(images=[decode(value) for value in values], return_tensors="pt")
-        pooled = self._valid(out["image_position_ids"]) // self.processor.pooling_kernel_size ** 2
-        return Images(out["pixel_values"], out["image_position_ids"], tuple(int(n) for n in pooled))
+        soft = self._valid(out["image_position_ids"]) // self.positions_per_token
+        return Images(out["pixel_values"], out["image_position_ids"], tuple(int(n) for n in soft))
 
     def soft_tokens(self, height: int, width: int) -> int:
         """Soft tokens of an image of ``height`` x ``width`` pixels: the processor's own resize target (Transformers'
-        ``get_aspect_ratio_preserving_size``) in patches, pooled."""
+        ``get_aspect_ratio_preserving_size``, the same in both processors) in patches, pooled."""
         from transformers.models.gemma4.image_processing_gemma4 import get_aspect_ratio_preserving_size
 
         patch, pool = self.processor.patch_size, self.processor.pooling_kernel_size
@@ -127,15 +138,16 @@ class Vision:
                       tuple(n for p in parts for n in p.tokens))
 
     def summary(self, images: Sequence[PlannedImage]) -> tuple[list[int], int]:
-        """Each planned image's pixels as the vision tower reads them, and the soft tokens of them all."""
+        """Each planned image's pixels as the backbone reads them, and the soft tokens of them all."""
         per_token = self.processor.pooling_kernel_size ** 2 * self.processor.patch_size ** 2
         return [planned.tokens * per_token for planned in images], sum(planned.tokens for planned in images)
 
 
 def embed(backbone: Any, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
     """(soft tokens, hidden): every image's soft-token embeddings in order, from the backbone's vision tower and
-    embedder (not scaled like the token embeddings, as Gemma 4 does it)."""
-    param = next(backbone.vision_tower.parameters())
+    embedder, or its encoder-free image embedder (the 12B); not scaled like the token embeddings, as Gemma 4 does it."""
+    reader = getattr(backbone, "vision_tower", None) or backbone.embed_vision
+    param = next(reader.parameters())
     features = backbone.get_image_features(pixel_values.to(param.device, param.dtype),
                                            position_ids.to(param.device), return_dict=True).pooler_output
     return torch.cat(list(features))

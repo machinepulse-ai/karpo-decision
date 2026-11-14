@@ -27,7 +27,7 @@ The layers are re-expressed with the backbone's own modules and weights (``Gemma
 q/k/v norms, the layer scalar kept in the activations' dtype); the Transformers model is not patched. Per-layer
 embeddings, shared key-value layers and expert blocks (other Gemma 4 sizes) are refused.
 
-A pack with images (``families/gemma/vision.py``) gets the vision tower's soft-token embeddings at the soft tokens'
+A pack with images (``families/gemma/vision.py``) gets the backbone's soft-token embeddings at the soft tokens'
 rows; in the sliding layers each image's soft tokens are recomputed after the varlen call so that they see their whole
 image (Gemma 4's bidirectional images; an image is no longer than the window), an image in a branch with what the
 branch sees.

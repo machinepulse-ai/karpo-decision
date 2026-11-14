@@ -7,7 +7,7 @@ token embeddings (tied with the head), every norm and the readout stay as pretra
 In a bidirectional model the global layers see what a token may see in both directions and the sliding-window layers
 stay causal inside their window (``packed.py``). ``MARKER`` only satisfies the encoder's check and is escaped from
 request text; block layouts place no marker token. The 12B (``google/gemma-4-12B-it``, ``gemma4_unified``) has the
-same text layers and no vision tower (images go through an embedder), and loads as its own model class."""
+same text layers and an encoder-free image embedder instead of a vision tower, and loads as its own model class."""
 
 from __future__ import annotations
 
@@ -25,20 +25,22 @@ from .packed import Packed
 from .vision import ImageTokens, Vision
 
 MODEL_TYPE = "gemma4"
+#: The 12B's ``model_type``: the 31B's text layers, and an encoder-free image embedder instead of a vision tower.
+UNIFIED_MODEL_TYPE = "gemma4_unified"
 MARKER = "<mask>"
 TEMPLATES = ("karpo-blocks-v1",)
 #: The trained parameters: every decoder layer's linear projections (Sieve-31B-v3's choice, 29,286,727,680 for the 31B).
 TRAINED = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 #: The backbone class of each ``model_type`` the family reads.
-BACKBONES = {"gemma4": Gemma4Model, "gemma4_unified": Gemma4UnifiedModel}
+BACKBONES = {MODEL_TYPE: Gemma4Model, UNIFIED_MODEL_TYPE: Gemma4UnifiedModel}
 
-__all__ = ["MARKER", "MODEL_TYPE", "TEMPLATES", "Packed", "Processor", "load_backbone", "load_processor",
-           "logit_cap", "vision_of"]
+__all__ = ["MARKER", "MODEL_TYPE", "TEMPLATES", "UNIFIED_MODEL_TYPE", "Packed", "Processor", "load_backbone",
+           "load_processor", "logit_cap", "vision_of"]
 
 
 class Processor:
     """The tokenizer in the processor's place (chat template, tokenization of text alone, saving), and ``vision`` for a
-    backbone with a vision tower (None: the checkpoint reads text only)."""
+    backbone that reads images (None: the checkpoint reads text only)."""
 
     def __init__(self, tokenizer: Any, vision: Vision | None = None) -> None:
         self.tokenizer = tokenizer
@@ -60,14 +62,16 @@ class Processor:
 
 
 def vision_of(directory: Path) -> Vision | None:
-    """``Vision`` when ``directory``'s ``config.json`` is a Gemma 4 with a vision tower, else None."""
+    """``Vision`` when ``directory``'s ``config.json`` is a Gemma 4 that reads images (a vision tower, or the 12B's
+    image embedder), else None."""
     path = Path(directory) / "config.json"
     if not path.exists():
         return None
     config = json.loads(path.read_text())
-    if config.get("model_type") != MODEL_TYPE or not config.get("vision_config"):
+    if config.get("model_type") not in (MODEL_TYPE, UNIFIED_MODEL_TYPE) or not config.get("vision_config"):
         return None
-    return Vision(ImageTokens(config["boi_token_id"], config["image_token_id"], config["eoi_token_id"]))
+    tokens = ImageTokens(config["boi_token_id"], config["image_token_id"], config["eoi_token_id"])
+    return Vision(tokens, unified=config["model_type"] == UNIFIED_MODEL_TYPE)
 
 
 def load_processor(directory: str | Path, max_pixels: int) -> Processor:
@@ -78,7 +82,7 @@ def load_processor(directory: str | Path, max_pixels: int) -> Processor:
 
 def load_backbone(weights: str | Path, dtype: torch.dtype) -> Gemma4Model | Gemma4UnifiedModel:
     backbone = BACKBONES[model_type(weights)].from_pretrained(str(weights), dtype=dtype, attn_implementation="sdpa")
-    for name, param in backbone.named_parameters():  # the vision tower, embeddings and norms stay as pretrained
+    for name, param in backbone.named_parameters():  # the image reader, embeddings and norms stay as pretrained
         param.requires_grad_(name.startswith("language_model.layers.") and name.rsplit(".", 2)[-2] in TRAINED)
     return backbone
 

@@ -19,8 +19,8 @@ its image pixels, on the rank that runs it, while that rank's GPU runs the reque
 readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
 
 A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
-Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
-``families/gemma/vision.py``) and Qwen3.5 read images, and the 12B reads text only. The opt-in paths combine and are
+Qwen3.5 checkpoint. Every checkpoint reads images: the Gemma ones through ``families/gemma/vision.py`` (the 31B's
+vision tower, the 12B's image embedder), Qwen3.5 through its vision tower. The opt-in paths combine and are
 refused by ``serve.paths`` at startup for a backbone that does not run them: ``--fp8`` runs the decoder projections in
 FP8 (Gemma: ``serve.fp8``; Qwen3.5: ``serve.qwen_fp8``); ``--graphs`` replays CUDA graphs captured at load (Gemma:
 single-question text-only requests up to the graphs' limit, ``serve.graphs``, not with the ``blackwell`` extra's

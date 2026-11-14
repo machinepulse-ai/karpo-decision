@@ -101,10 +101,10 @@ def test_engine_asks_require_for_every_opt_in_path(monkeypatch):
     assert asked == [{"fp8": True, "triton_attention": False, "graphs": True}]
 
 
-def vision_decider(tokens=63):
+def vision_decider(tokens=63, unified=False):
     loaded = decider()
     loaded.encoder = types.SimpleNamespace(processor=types.SimpleNamespace(
-        vision=types.SimpleNamespace(summary=lambda images: ([1_000_000], tokens))))
+        vision=types.SimpleNamespace(summary=lambda images: ([1_000_000], tokens), unified=unified)))
     loaded.plans = []
 
     def plan(request):
@@ -117,6 +117,16 @@ def vision_decider(tokens=63):
     loaded.decide = lambda readings, plans: [{"answers": {"q": {"choice": "a"}}, "usage": {"input_tokens": 1}}
                                              for _ in readings]
     return loaded
+
+
+@pytest.mark.parametrize(("unified", "reader"), [(False, "vision tower"), (True, "image embedder")])
+def test_engine_names_what_reads_the_images(monkeypatch, unified, reader):
+    """The 31B reads images with its vision tower, the 12B (``unified``) with its image embedder."""
+    loaded = vision_decider(unified=unified)
+    monkeypatch.setattr(engine, "require", lambda checkpoint, **_: frozenset())
+    monkeypatch.setattr(engine.Decider, "from_pretrained", classmethod(lambda cls, directory, **_: loaded))
+    e = engine.DecisionIndexEngine(checkpoint="ckpt", device="cpu")
+    assert f"the backbone's {reader};" in e.provenance["images"]
 
 
 def test_engine_reads_the_kits_images_and_reports_them(monkeypatch):
@@ -164,7 +174,7 @@ def test_engine_answers_unsupported_for_an_image_whose_pixels_do_not_decode(monk
 
 
 def test_engine_answers_unsupported_for_images_on_a_checkpoint_without_vision(monkeypatch):
-    """The 12B (``vision`` None): its plan refuses images with ``TextOnlyError``."""
+    """A checkpoint that reads text only (``vision`` None): its plan refuses images with ``TextOnlyError``."""
     loaded = decider()
 
     def plan(request):

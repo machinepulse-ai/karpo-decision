@@ -16,7 +16,7 @@ Models:
 | Model | Backbone | Reads |
 |---|---|---|
 | [karpo-decision-31B](https://huggingface.co/MachinePulseAI/karpo-decision-31B) | Gemma 4 31B | text, images |
-| [karpo-decision-12B](https://huggingface.co/MachinePulseAI/karpo-decision-12B) | Gemma 4 12B | text |
+| [karpo-decision-12B](https://huggingface.co/MachinePulseAI/karpo-decision-12B) | Gemma 4 12B | text, images |
 | [karpo-decision-9B](https://huggingface.co/MachinePulseAI/karpo-decision-9B) | Qwen3.5 9B | text, images |
 | [karpo-decision-4B](https://huggingface.co/MachinePulseAI/karpo-decision-4B) | Qwen3.5 4B | text, images |
 | [karpo-decision-2B](https://huggingface.co/MachinePulseAI/karpo-decision-2B) | Qwen3.5 2B | text, images |
@@ -57,10 +57,10 @@ response = decider.decide({
 print(response["answers"])
 ```
 
-The 31B and the Qwen3.5 checkpoints also read images: a screenshot at `state.viewport_screenshot`, as an `image_url`
-part with a `data:image/...` URL, and more at `images` (data URLs; in Python also PIL images or file paths). The 31B
-also reads images placed where the state or a question refers to them (see TypeSafe System One compatibility); each
-of its images takes up to 560 tokens of `--max-length` plus a few markers.
+Every checkpoint also reads images: a screenshot at `state.viewport_screenshot`, as an `image_url` part with a
+`data:image/...` URL, and more at `images` (data URLs; in Python also PIL images or file paths). The Gemma checkpoints
+also read images placed where the state or a question refers to them (see TypeSafe System One compatibility); each of
+their images takes up to 560 tokens of `--max-length` plus a few markers.
 
 ## Serving
 
@@ -130,9 +130,9 @@ included:
   another encoding.
 
 Unlike TypeSafe's API, image sizes are not checked (each image is scaled to up to 560 tokens) and there are no `box`
-questions. Placed images need the 31B: the Qwen3.5 checkpoints read only the screenshot and `images`, and the 12B
-reads text only (400). In Python, `Decider.decide` takes `assets` (with `data_base64`, or `data` as bytes) and image
-parts the same way.
+questions. Placed images need a Gemma checkpoint (31B, 12B): the Qwen3.5 checkpoints read only the screenshot and
+`images` (400). In Python, `Decider.decide` takes `assets` (with `data_base64`, or `data` as bytes) and image parts the
+same way.
 
 ## Decision Index
 

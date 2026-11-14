@@ -5,7 +5,7 @@ with each token's position and segment, for a family whose attention keeps branc
   context header and before the state text; its inline images (``assets.resolve``: asset references and image parts)
   sit where they occur, in the state text, or in a question's instructions or criteria inside that question's branch,
   where the shared block's list of questions shows ``IMAGE_PLACEHOLDER`` (``families/gemma/vision.py``). A checkpoint
-  without a vision tower refuses images.
+  without image support refuses images.
 - A request with one question is one block (segment 0, positions 0..n-1): its state reads its question and options.
 - With several questions, the shared block (segment 0: system turn, the list of every question's instructions, the
   state) comes once, then each question's branch (segment k for the k-th branch of the sequence) with positions

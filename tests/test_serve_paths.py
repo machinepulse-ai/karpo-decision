@@ -214,7 +214,8 @@ def test_the_server_takes_graphs_from_its_flag():
 def test_runner_runs_one_request_on_its_device(monkeypatch):
     devices = []
     monkeypatch.setattr(server.torch.cuda, "set_device", devices.append)
-    decider = types.SimpleNamespace(decide=lambda request, plans: {"request": request, "plans": plans})
+    decider = types.SimpleNamespace(prepare=lambda plan: plan,
+                                    decide=lambda request, plans: {"request": request, "plans": plans})
     runner = server.Runner(decider, "cuda:3")
     assert runner.run({"q": {}}, ["sequence"]) == {"request": {"state": None, "questions": {"q": {}}},
                                                     "plans": [["sequence"]]}

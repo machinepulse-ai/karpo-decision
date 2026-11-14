@@ -12,9 +12,10 @@ encoding 415). Rank 0 encodes each request, so one outside the contract or with 
 422, and a body, image or asset it cannot read gets 400, without reaching the other ranks. Every rank loads the
 checkpoint on its own GPU and runs one request at a time: with ``--nproc_per_node N``, rank 0 runs each request on the
 rank with the fewest in flight, itself included, handing the encoded sequences to that rank over a CPU (gloo) group of
-the two and getting the answers back the same way; it listens once every rank has loaded. The
-``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes, readout, answers) times
-in milliseconds. Each request is logged as one JSON line without content.
+the two and getting the answers back the same way; it listens once every rank has loaded. A request's first pack gets
+its image pixels, on the rank that runs it, while that rank's GPU runs the request before it (``Decider.prepare``,
+``PREPARED_AHEAD``). The ``Server-Timing`` header gives the request's encode, share (the hand-over) and model (passes,
+readout, answers) times in milliseconds. Each request is logged as one JSON line without content.
 
 A checkpoint serves through the ``Decider``, warmed up with a text request for a block layout and a screenshot for a
 Qwen3.5 checkpoint. The 31B (a Gemma checkpoint with a vision tower,
@@ -74,6 +75,8 @@ SCREENSHOT_WARMUP_GREY = (200, 200, 200)
 SCREENSHOT_WARMUP_JPEG_QUALITY = 75
 SCREENSHOT_WARMUP_PAGE = {"url": "about:blank"}
 SCREENSHOT_WARMUP_QUESTIONS = {"blank": {"type": "noul", "instructions": "Is the page blank?"}}
+#: Requests whose first pack has its pixels before the GPU is free (``Decider.prepare``): the one running and the next.
+PREPARED_AHEAD = 2
 #: The ranks pass requests and answers to each other on the CPU.
 CHANNEL_BACKEND = "gloo"
 #: A rank waits on its channel between requests for as long as the server is idle: the default 30-minute timeout
@@ -166,11 +169,16 @@ class Runner:
     def __init__(self, decider: Decider, device: torch.device) -> None:
         self.decider, self.device = decider, device
         self.lock = threading.Lock()
+        self.ahead = threading.Semaphore(PREPARED_AHEAD)
 
     def run(self, questions: dict[str, Any], plan: list[Encoded]) -> dict[str, Any]:
-        with self.lock:
-            torch.cuda.set_device(self.device)
-            return self.decider.decide({"state": None, "questions": questions}, plans=[plan])
+        """The plan's first pack gets its pixels before the GPU lock, so they are made while the GPU runs the request
+        before it."""
+        with self.ahead:
+            prepared = self.decider.prepare(plan)
+            with self.lock:
+                torch.cuda.set_device(self.device)
+                return self.decider.decide({"state": None, "questions": questions}, plans=[prepared])
 
 
 class Channel:

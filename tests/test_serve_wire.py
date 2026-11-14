@@ -3,6 +3,7 @@ split into the request's JSON and its parts, each part claimed by one asset."""
 
 import gzip
 import sys
+import time
 
 import pytest
 
@@ -119,3 +120,38 @@ def test_more_members_or_frames_than_the_limit_are_refused(coding, compress):
     with pytest.raises(ValueError, match="members or zstd frames") as caught:
         wire.inflate(compress(b"x") * (wire.MAX_MEMBERS + 1), coding, LIMIT)
     assert not isinstance(caught.value, (wire.TooLarge, wire.UnsupportedEncoding))
+
+
+def test_multipart_reads_what_clients_send():
+    """A quoted boundary, a preamble and an epilogue, padding after a boundary, headers in any order, a token name, an
+    empty part and an identity Content-Transfer-Encoding."""
+    body = (b"preamble\r\n--b0 undary \t\r\nContent-Disposition: form-data; name=\"request\"\r\n"
+            b"Content-Type: application/json\r\n\r\n{}\r\n"
+            b"--b0 undary\r\nContent-Type: image/png\r\nContent-Disposition: form-data; filename=\"a.png\"; "
+            b"name=\"asset-0\"\r\nContent-Transfer-Encoding: binary\r\n\r\n\x89PNG\r\n--b0 undar\r\n"
+            b"--b0 undary\r\ncontent-disposition: form-data;name=asset-1\r\n\r\n\r\n"
+            b"--b0 undary--\r\nepilogue")
+    request, parts = wire.parse_multipart(body, 'multipart/form-data; boundary="b0 undary"')
+    assert request == b"{}" and parts == {"asset-0": b"\x89PNG\r\n--b0 undar", "asset-1": b""}
+
+
+@pytest.mark.parametrize(("body", "message"), [
+    (b'--b\r\nContent-Disposition: form-data; name="request"\r\nContent-Transfer-Encoding: base64\r\n\r\ne30=\r\n--b--',
+     "Content-Transfer-Encoding"),
+    (b'--b\nContent-Disposition: form-data; name="request"\n\n{}\n--b--', "CRLF"),
+    (b'--b\r\nContent-Disposition: form-data; name="request"\r\n\r\n{}', "cut short"),
+    (b"--b\r\nContent-Disposition: form-data; name*=utf-8''request\r\n\r\n{}\r\n--b--", "needs a name"),
+])
+def test_multipart_refuses_what_rfc_7578_rules_out(body, message):
+    with pytest.raises(ValueError, match=message):
+        wire.parse_multipart(body, "multipart/form-data; boundary=b")
+
+
+def test_multipart_bodies_split_in_linear_time():
+    """Each part is found with a byte search, never line by line: newlines and many parts cost little."""
+    start = time.perf_counter()
+    newlines = multipart([("request", b"{}"), ("asset-0", b"\n" * (8 << 20))])
+    assert wire.parse_multipart(newlines[1], newlines[0])[1]["asset-0"] == b"\n" * (8 << 20)
+    many = multipart([("request", b"{}"), *((f"a{i}", b"x") for i in range(100_000))])
+    assert len(wire.parse_multipart(many[1], many[0])[1]) == 100_000
+    assert time.perf_counter() - start < 2.0

@@ -157,4 +157,5 @@ def test_four_processes_share_the_requests_over_a_gloo_group():
     assert any(a[0] < b[1] and b[0] < a[1] for a, first in spans for b, second in spans if first != second)
     assert result["failed"] == (None, "ValueError")
     after, error = result["after"]
-    assert error is None and (after["rank"], after["questions"], after["plan"]) == (1, {"n": -1}, [-1])  # still following
+    # The rank kept following after its failure.
+    assert error is None and (after["rank"], after["questions"], after["plan"]) == (1, {"n": -1}, [-1])

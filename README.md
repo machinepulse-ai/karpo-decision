@@ -174,10 +174,10 @@ uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
 
 ## License
 
-Copyright (c) 2026 MachinePulse Limited.
+Copyright (c) 2026 MachinePulse.
 
 The code in this repository is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)).
 
-The model weights are not part of this repository. They are licensed separately, under the MachinePulse Community
-License in each model's Hugging Face repository (for the 31B:
+The model weights are not part of this repository. They are licensed separately, under the Apache License,
+Version 2.0, in each model's Hugging Face repository (for the 31B:
 [LICENSE](https://huggingface.co/MachinePulseAI/karpo-decision-31B/blob/main/LICENSE)).

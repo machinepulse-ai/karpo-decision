@@ -174,7 +174,7 @@ uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
 
 ## License
 
-Copyright (c) 2026 MachinePulse Pte. Ltd.
+Copyright 2026 MachinePulse Pte. Ltd.
 
 The code in this repository is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)).
 

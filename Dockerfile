@@ -10,6 +10,6 @@ WORKDIR /opt/karpo-decision
 COPY requirements-serve.txt .
 RUN pip install -r requirements-serve.txt
 
-COPY pyproject.toml README.md ./
+COPY LICENSE pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-deps .

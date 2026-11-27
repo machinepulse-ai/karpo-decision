@@ -6,6 +6,8 @@ readout from a Gemma 4 or Qwen3.5 backbone. It answers through `karpo_decision.d
 [Decision Index](https://github.com/apolinario/decision-index) kit's suite with
 `karpo_decision.serve.engine:DecisionIndexEngine` (the kit installed separately).
 
+Hosted API: [platform.karpo.ai](https://platform.karpo.ai).
+
 karpo-decision-31B has the highest Full score on the
 [Decision Index board](https://huggingface.co/spaces/multimodalart/jev-decision-index) (November 12, 2026):
 
